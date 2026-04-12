@@ -1,3 +1,33 @@
+//! Cross-platform native app automation for Rust.
+//!
+//! Launch, focus, control, and capture output from GUI applications programmatically.
+//! The API mirrors `std::process::Command`/`Child` for familiarity, with additional
+//! GUI-specific methods for window focus, keystroke injection, and background launching.
+//!
+//! # Example
+//!
+//! ```no_run
+//! use launch_control::Command;
+//! use std::process::Stdio;
+//!
+//! // Simple launch (like std::process::Command)
+//! let mut child = Command::new("/Applications/Safari.app")
+//!     .arg("https://example.com")
+//!     .spawn()?;
+//!
+//! // With output capture
+//! let mut child = Command::new("/Applications/Foo.app")
+//!     .stdout(Stdio::piped())
+//!     .stderr(Stdio::piped())
+//!     .background(true)
+//!     .spawn()?;
+//!
+//! // GUI-specific extras
+//! child.focus()?;
+//! child.kill()?;
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+
 mod error;
 
 #[cfg(target_os = "macos")]
@@ -8,45 +38,50 @@ mod windows;
 pub use error::{Error, Result};
 
 use std::ffi::OsStr;
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::process::{ExitStatus, Stdio};
 use std::sync::mpsc;
-use std::io::{BufRead, BufReader, Read};
 
-/// Builder for launching an application.
-pub struct AppLauncher {
-    path: PathBuf,
-    args: Vec<String>,
-    background: bool,
+/// Builder for launching an application. Mirrors `std::process::Command`.
+///
+/// On macOS, the path should be an `.app` bundle (e.g. `/Applications/Safari.app`).
+/// A binary path inside `.app/Contents/MacOS/` is also accepted and will be resolved
+/// to the bundle automatically.
+///
+/// On Windows, the path should be the executable path.
+pub struct Command {
+    pub(crate) path: PathBuf,
+    pub(crate) args: Vec<String>,
+    pub(crate) background: bool,
     /// URL to open via the app (e.g. custom scheme URLs).
     /// When set, uses NSWorkspace.openURLs on macOS instead of openApplicationAtURL.
-    url: Option<String>,
+    pub(crate) url: Option<String>,
+    pub(crate) stdout_cfg: Option<Stdio>,
+    pub(crate) stderr_cfg: Option<Stdio>,
 }
 
-impl AppLauncher {
-    /// Create a new launcher for the application at the given path.
-    ///
-    /// On macOS, this should be an `.app` bundle path (e.g. `/Applications/Safari.app`).
-    /// A binary path inside `.app/Contents/MacOS/` is also accepted and will be resolved
-    /// to the bundle automatically.
-    ///
-    /// On Windows, this should be the executable path.
+impl Command {
+    /// Create a new command for the application at the given path.
     pub fn new(path: impl AsRef<Path>) -> Self {
         Self {
             path: path.as_ref().to_path_buf(),
             args: Vec::new(),
             background: false,
             url: None,
+            stdout_cfg: None,
+            stderr_cfg: None,
         }
     }
 
     /// Add a single argument.
-    pub fn arg(mut self, arg: impl AsRef<OsStr>) -> Self {
+    pub fn arg(&mut self, arg: impl AsRef<OsStr>) -> &mut Self {
         self.args.push(arg.as_ref().to_string_lossy().to_string());
         self
     }
 
     /// Add multiple arguments.
-    pub fn args(mut self, args: impl IntoIterator<Item = impl AsRef<OsStr>>) -> Self {
+    pub fn args(&mut self, args: impl IntoIterator<Item = impl AsRef<OsStr>>) -> &mut Self {
         for a in args {
             self.args.push(a.as_ref().to_string_lossy().to_string());
         }
@@ -55,91 +90,128 @@ impl AppLauncher {
 
     /// Open a URL via this application (e.g. custom scheme or `https://` URLs).
     /// On macOS, uses `NSWorkspace.openURLs` to route the URL through the app.
-    pub fn url(mut self, url: impl Into<String>) -> Self {
+    pub fn url(&mut self, url: impl Into<String>) -> &mut Self {
         self.url = Some(url.into());
         self
     }
 
     /// If true, launch without stealing focus (background mode).
     /// Default: false.
-    pub fn background(mut self, bg: bool) -> Self {
+    pub fn background(&mut self, bg: bool) -> &mut Self {
         self.background = bg;
         self
     }
 
-    /// Spawn the application and return a handle for lifecycle management.
-    pub fn spawn(self) -> Result<AppHandle> {
-        platform_spawn(self)
+    /// Configure stdout handling. Use `Stdio::piped()` to capture output.
+    pub fn stdout(&mut self, cfg: Stdio) -> &mut Self {
+        self.stdout_cfg = Some(cfg);
+        self
     }
 
-    /// Spawn the application via `Command::new()` with stderr piped, returning
-    /// a handle that supports both stdio access and GUI control (focus/kill).
-    ///
-    /// On macOS, resolves the binary from the `.app` bundle and uses
-    /// `NSRunningApplication` from the PID for focus/keystroke support.
-    /// Spawn with piped stdout/stderr. Returns the handle and output channels separately.
-    /// Output is auto-drained by background threads — dropping the channels is safe.
-    pub fn spawn_piped(self) -> Result<(PipedAppHandle, PipedOutput)> {
-        platform_spawn_piped(self)
+    /// Configure stderr handling. Use `Stdio::piped()` to capture output.
+    pub fn stderr(&mut self, cfg: Stdio) -> &mut Self {
+        self.stderr_cfg = Some(cfg);
+        self
+    }
+
+    /// Spawn the application and return a handle for lifecycle management.
+    pub fn spawn(&mut self) -> Result<Child> {
+        platform_spawn(self)
     }
 }
 
-/// Handle to a running application process.
-pub struct AppHandle {
+/// Handle to a running application process. Mirrors `std::process::Child`.
+///
+/// GUI-specific methods (`focus`, `send_save_keystroke`) are available in addition
+/// to the standard process lifecycle methods.
+pub struct Child {
     pid: u32,
+    /// Captured stdout (only present when launched with `.stdout(Stdio::piped())`).
+    pub stdout: Option<ChildStdout>,
+    /// Captured stderr (only present when launched with `.stderr(Stdio::piped())`).
+    pub stderr: Option<ChildStderr>,
     #[cfg(target_os = "macos")]
-    inner: macos::MacOSHandle,
+    inner: Option<macos::MacOSHandle>,
     #[cfg(target_os = "windows")]
     inner: windows::WindowsHandle,
 }
 
-impl AppHandle {
-    /// The OS process identifier.
-    pub fn pid(&self) -> u32 {
+impl Child {
+    /// The OS process identifier. Mirrors `std::process::Child::id()`.
+    pub fn id(&self) -> u32 {
         self.pid
     }
 
-    /// Check if the application is still running.
-    pub fn is_running(&self) -> bool {
+    /// Force-terminate the application. Mirrors `std::process::Child::kill()`.
+    pub fn kill(&mut self) -> io::Result<()> {
         #[cfg(target_os = "macos")]
         {
-            return self.inner.is_running();
+            let pid = self.pid;
+            let ret = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+            if ret != 0 {
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::ESRCH) {
+                    return Ok(()); // already dead
+                }
+                return Err(err);
+            }
+            return Ok(());
         }
         #[cfg(target_os = "windows")]
         {
-            return self.inner.is_running();
+            return self.inner.kill_io();
         }
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
-            false
+            Err(io::Error::new(io::ErrorKind::Unsupported, "unsupported platform"))
         }
     }
+
+    /// Wait for the process to exit. Mirrors `std::process::Child::wait()`.
+    ///
+    /// On macOS, this polls process liveness since GUI apps launched via NSWorkspace
+    /// are not direct children (so `waitpid` is not available).
+    pub fn wait(&mut self) -> io::Result<ExitStatus> {
+        loop {
+            if let Some(status) = self.try_wait()? {
+                return Ok(status);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
+    /// Check if the process has exited without blocking. Mirrors `std::process::Child::try_wait()`.
+    ///
+    /// Returns `Ok(Some(status))` if exited, `Ok(None)` if still running.
+    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        #[cfg(target_os = "macos")]
+        {
+            return macos::try_wait(self.pid);
+        }
+        #[cfg(target_os = "windows")]
+        {
+            return self.inner.try_wait();
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            Err(io::Error::new(io::ErrorKind::Unsupported, "unsupported platform"))
+        }
+    }
+
+    // -- GUI-specific extras (not on std::process::Child) --
 
     /// Bring the application to the foreground.
     pub fn focus(&self) -> Result<()> {
         #[cfg(target_os = "macos")]
         {
-            return self.inner.focus();
+            return match self.inner {
+                Some(ref inner) => inner.focus(),
+                None => Err(Error::Platform("no GUI handle available".into())),
+            };
         }
         #[cfg(target_os = "windows")]
         {
             return self.inner.focus();
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        {
-            Err(Error::Unsupported)
-        }
-    }
-
-    /// Force-terminate the application.
-    pub fn kill(&self) -> Result<()> {
-        #[cfg(target_os = "macos")]
-        {
-            return self.inner.kill();
-        }
-        #[cfg(target_os = "windows")]
-        {
-            return self.inner.kill();
         }
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
@@ -152,7 +224,10 @@ impl AppHandle {
     pub fn send_save_keystroke(&self) -> Result<()> {
         #[cfg(target_os = "macos")]
         {
-            return self.inner.send_cmd_s();
+            return match self.inner {
+                Some(ref inner) => inner.send_cmd_s(),
+                None => Err(Error::Platform("no GUI handle available".into())),
+            };
         }
         #[cfg(target_os = "windows")]
         {
@@ -166,32 +241,119 @@ impl AppHandle {
     }
 }
 
-/// Output channels from a piped app launch.
+/// Captured stdout from a launched application. Implements `Read` and `BufRead`.
 ///
-/// Drain threads run automatically in the background. If the receiver is dropped,
-/// the drain thread continues reading (preventing pipe blocking) but discards lines.
-pub struct PipedOutput {
-    pub stdout: Option<mpsc::Receiver<String>>,
-    pub stderr: Option<mpsc::Receiver<String>>,
+/// Backed by a background drain thread that reads eagerly from the underlying
+/// PTY/pipe to prevent the application from blocking when buffers fill.
+/// If this value is dropped, the drain thread continues consuming data.
+pub struct ChildStdout {
+    rx: mpsc::Receiver<String>,
+    buf: Vec<u8>,
+    pos: usize,
 }
 
-/// Handle to a running application launched with piped stdout/stderr.
+impl ChildStdout {
+    /// Receive a single line with a timeout. Convenience for callers that need
+    /// deadline-based reading (e.g. waiting for startup markers).
+    pub fn recv_timeout(&self, timeout: std::time::Duration) -> std::result::Result<String, mpsc::RecvTimeoutError> {
+        self.rx.recv_timeout(timeout)
+    }
+}
+
+impl Read for ChildStdout {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.pos >= self.buf.len() {
+            match self.rx.recv() {
+                Ok(line) => {
+                    self.buf = format!("{line}\n").into_bytes();
+                    self.pos = 0;
+                }
+                Err(_) => return Ok(0), // EOF — drain thread exited
+            }
+        }
+        let n = std::cmp::min(buf.len(), self.buf.len() - self.pos);
+        buf[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+impl BufRead for ChildStdout {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        if self.pos >= self.buf.len() {
+            match self.rx.recv() {
+                Ok(line) => {
+                    self.buf = format!("{line}\n").into_bytes();
+                    self.pos = 0;
+                }
+                Err(_) => {
+                    self.buf.clear();
+                    self.pos = 0;
+                    return Ok(&[]);
+                }
+            }
+        }
+        Ok(&self.buf[self.pos..])
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.pos += amt;
+    }
+}
+
+/// Captured stderr from a launched application. Implements `Read` and `BufRead`.
 ///
-/// On macOS, uses `/usr/bin/open` with FIFOs for background launch + output capture.
-/// GUI operations (focus, kill, keystroke) use `NSRunningApplication`.
-///
-/// Stdout/stderr are drained by background threads automatically.
-/// The output channels are returned separately via `spawn_piped()` so they
-/// don't need to be stored in the handle (which may be shared across threads).
-pub struct PipedAppHandle {
-    pid: u32,
-    #[cfg(target_os = "macos")]
-    inner: Option<macos::MacOSHandle>,
+/// Identical to `ChildStdout` — separate type for API clarity.
+pub struct ChildStderr {
+    rx: mpsc::Receiver<String>,
+    buf: Vec<u8>,
+    pos: usize,
+}
+
+impl Read for ChildStderr {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.pos >= self.buf.len() {
+            match self.rx.recv() {
+                Ok(line) => {
+                    self.buf = format!("{line}\n").into_bytes();
+                    self.pos = 0;
+                }
+                Err(_) => return Ok(0),
+            }
+        }
+        let n = std::cmp::min(buf.len(), self.buf.len() - self.pos);
+        buf[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+impl BufRead for ChildStderr {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        if self.pos >= self.buf.len() {
+            match self.rx.recv() {
+                Ok(line) => {
+                    self.buf = format!("{line}\n").into_bytes();
+                    self.pos = 0;
+                }
+                Err(_) => {
+                    self.buf.clear();
+                    self.pos = 0;
+                    return Ok(&[]);
+                }
+            }
+        }
+        Ok(&self.buf[self.pos..])
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.pos += amt;
+    }
 }
 
 /// Start a background thread that reads lines and sends to channel.
 /// If receiver is dropped, continues draining to prevent pipe blocking.
-fn start_drain_thread(reader: impl Read + Send + 'static, tx: mpsc::Sender<String>) {
+pub(crate) fn start_drain_thread(reader: impl Read + Send + 'static, tx: mpsc::Sender<String>) {
     std::thread::spawn(move || {
         let reader = BufReader::new(reader);
         for line in reader.lines() {
@@ -203,79 +365,27 @@ fn start_drain_thread(reader: impl Read + Send + 'static, tx: mpsc::Sender<Strin
     });
 }
 
-impl PipedAppHandle {
-    pub fn pid(&self) -> u32 {
-        self.pid
-    }
-
-    pub fn is_running(&self) -> bool {
-        #[cfg(target_os = "macos")]
-        if let Some(ref inner) = self.inner {
-            return inner.is_running();
-        }
-        unsafe { libc::kill(self.pid as i32, 0) == 0 }
-    }
-
-    pub fn focus(&self) -> Result<()> {
-        #[cfg(target_os = "macos")]
-        if let Some(ref inner) = self.inner {
-            return inner.focus();
-        }
-        Err(Error::Unsupported)
-    }
-
-    pub fn kill(&self) -> Result<()> {
-        let ret = unsafe { libc::kill(self.pid as i32, libc::SIGKILL) };
-        if ret != 0 {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::ESRCH) {
-                return Ok(());
-            }
-            return Err(Error::Platform(format!(
-                "failed to kill pid {}: {err}",
-                self.pid
-            )));
-        }
-        Ok(())
-    }
-
-    pub fn send_save_keystroke(&self) -> Result<()> {
-        #[cfg(target_os = "macos")]
-        if let Some(ref inner) = self.inner {
-            return inner.send_cmd_s();
-        }
-        Err(Error::Unsupported)
-    }
-
+pub(crate) fn make_child_stdout(rx: mpsc::Receiver<String>) -> ChildStdout {
+    ChildStdout { rx, buf: Vec::new(), pos: 0 }
 }
 
+pub(crate) fn make_child_stderr(rx: mpsc::Receiver<String>) -> ChildStderr {
+    ChildStderr { rx, buf: Vec::new(), pos: 0 }
+}
+
+// -- Platform dispatch --
 
 #[cfg(target_os = "macos")]
-fn platform_spawn(launcher: AppLauncher) -> Result<AppHandle> {
-    macos::spawn(launcher)
+fn platform_spawn(cmd: &mut Command) -> Result<Child> {
+    macos::spawn(cmd)
 }
 
 #[cfg(target_os = "windows")]
-fn platform_spawn(launcher: AppLauncher) -> Result<AppHandle> {
-    windows::spawn(launcher)
+fn platform_spawn(cmd: &mut Command) -> Result<Child> {
+    windows::spawn(cmd)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn platform_spawn(_launcher: AppLauncher) -> Result<AppHandle> {
-    Err(Error::Unsupported)
-}
-
-#[cfg(target_os = "macos")]
-fn platform_spawn_piped(launcher: AppLauncher) -> Result<(PipedAppHandle, PipedOutput)> {
-    macos::spawn_piped(launcher)
-}
-
-#[cfg(target_os = "windows")]
-fn platform_spawn_piped(_launcher: AppLauncher) -> Result<(PipedAppHandle, PipedOutput)> {
-    Err(Error::Unsupported)
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn platform_spawn_piped(_launcher: AppLauncher) -> Result<(PipedAppHandle, PipedOutput)> {
+fn platform_spawn(_cmd: &mut Command) -> Result<Child> {
     Err(Error::Unsupported)
 }

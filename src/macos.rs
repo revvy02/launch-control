@@ -1,5 +1,5 @@
 use crate::error::{Error, Result};
-use crate::AppLauncher;
+use crate::Command;
 
 use objc2::rc::Retained;
 use objc2_app_kit::{
@@ -8,6 +8,8 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{NSArray, NSString, NSURL};
 
+use std::io;
+use std::process::ExitStatus;
 use std::sync::mpsc;
 
 /// macOS-specific handle wrapping NSRunningApplication.
@@ -17,15 +19,6 @@ pub(crate) struct MacOSHandle {
 }
 
 impl MacOSHandle {
-    pub fn is_running(&self) -> bool {
-        // Check via kill(pid, 0) as a reliable fallback — NSRunningApplication
-        // state can be stale from a CLI process without an event loop.
-        if self.app.isTerminated() {
-            return false;
-        }
-        unsafe { libc::kill(self.pid as i32, 0) == 0 }
-    }
-
     pub fn focus(&self) -> Result<()> {
         if self.app.isTerminated() {
             return Err(Error::Terminated);
@@ -43,21 +36,6 @@ impl MacOSHandle {
             &current,
             NSApplicationActivationOptions::ActivateAllWindows,
         );
-        Ok(())
-    }
-
-    pub fn kill(&self) -> Result<()> {
-        let ret = unsafe { libc::kill(self.pid as i32, libc::SIGKILL) };
-        if ret != 0 {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::ESRCH) {
-                return Ok(()); // already dead
-            }
-            return Err(Error::Platform(format!(
-                "failed to kill pid {}: {err}",
-                self.pid
-            )));
-        }
         Ok(())
     }
 
@@ -150,12 +128,57 @@ fn send_keystroke_to_pid(pid: u32, keycode: u16, flags: u64) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn spawn(launcher: AppLauncher) -> Result<crate::AppHandle> {
-    let path = &launcher.path;
+/// Check if a process has exited. Returns synthetic ExitStatus.
+///
+/// macOS GUI apps launched via NSWorkspace are not our child processes,
+/// so `waitpid` is not available. We use `kill(pid, 0)` to check liveness.
+pub(crate) fn try_wait(pid: u32) -> io::Result<Option<ExitStatus>> {
+    let ret = unsafe { libc::kill(pid as i32, 0) };
+    if ret == 0 {
+        // Process is still running
+        Ok(None)
+    } else {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            // Process does not exist — it has exited.
+            // Synthesize a successful exit status. We can't get the real exit code
+            // from a process that isn't our child.
+            Ok(Some(make_exit_status(0)))
+        } else {
+            Err(err)
+        }
+    }
+}
+
+/// Create an ExitStatus from a raw wait status.
+/// On Unix, ExitStatus wraps a libc wait status — use `__WEXITSTATUS` encoding.
+fn make_exit_status(code: i32) -> ExitStatus {
+    // Encode as a normal exit: bits 15:8 = exit code, bits 7:0 = 0 (no signal)
+    let wait_status = (code & 0xFF) << 8;
+    // SAFETY: ExitStatus on Unix wraps a c_int wait status
+    unsafe { std::mem::transmute::<i32, ExitStatus>(wait_status) }
+}
+
+/// Single spawn function — handles both piped and non-piped based on Command's stdio config.
+pub(crate) fn spawn(cmd: &mut Command) -> Result<crate::Child> {
+    let path = &cmd.path;
 
     if !path.exists() {
         return Err(Error::NotFound(path.display().to_string()));
     }
+
+    let needs_piped = cmd.stdout_cfg.is_some() || cmd.stderr_cfg.is_some();
+
+    if needs_piped {
+        spawn_piped(cmd)
+    } else {
+        spawn_simple(cmd)
+    }
+}
+
+/// Launch via NSWorkspace (no stdio capture).
+fn spawn_simple(cmd: &mut Command) -> Result<crate::Child> {
+    let path = &cmd.path;
 
     // NSWorkspace expects an .app bundle URL. If the user passed the inner
     // binary (e.g. .../Contents/MacOS/RobloxStudio), walk up to find it.
@@ -168,14 +191,14 @@ pub(crate) fn spawn(launcher: AppLauncher) -> Result<crate::AppHandle> {
     // Configure launch options
     let config = NSWorkspaceOpenConfiguration::new();
     config.setCreatesNewApplicationInstance(true);
-    config.setActivates(!launcher.background);
-    if launcher.background {
+    config.setActivates(!cmd.background);
+    if cmd.background {
         config.setHides(true);
     }
 
-    if !launcher.args.is_empty() {
+    if !cmd.args.is_empty() {
         let ns_args: Vec<Retained<NSString>> =
-            launcher.args.iter().map(|a| NSString::from_str(a)).collect();
+            cmd.args.iter().map(|a| NSString::from_str(a)).collect();
         let ns_array = NSArray::from_retained_slice(&ns_args);
         config.setArguments(&ns_array);
     }
@@ -203,8 +226,8 @@ pub(crate) fn spawn(launcher: AppLauncher) -> Result<crate::AppHandle> {
 
     let workspace = NSWorkspace::sharedWorkspace();
 
-    if let Some(ref open_url) = launcher.url {
-        // URL mode: open a URL (e.g. roblox://placeId=XXX) with the specified app
+    if let Some(ref open_url) = cmd.url {
+        // URL mode: open a URL (e.g. custom://scheme) with the specified app
         let url_str = NSString::from_str(open_url);
         let open_nsurl = NSURL::URLWithString(&url_str)
             .ok_or_else(|| Error::Platform(format!("invalid URL: {open_url}")))?;
@@ -236,13 +259,15 @@ pub(crate) fn spawn(launcher: AppLauncher) -> Result<crate::AppHandle> {
     }
 
     // Extra hide call in case the app self-activates during startup
-    if launcher.background {
+    if cmd.background {
         result.hide();
     }
 
-    Ok(crate::AppHandle {
+    Ok(crate::Child {
         pid: pid as u32,
-        inner: MacOSHandle { app: result, pid: pid as u32 },
+        stdout: None,
+        stderr: None,
+        inner: Some(MacOSHandle { app: result, pid: pid as u32 }),
     })
 }
 
@@ -252,8 +277,8 @@ pub(crate) fn spawn(launcher: AppLauncher) -> Result<crate::AppHandle> {
 /// Creates pseudo-terminal pairs for stdout/stderr — unlike FIFOs/pipes, ptys never
 /// SIGPIPE or block the writer, so the app can't hang regardless of reader state.
 /// Gets `NSRunningApplication` from PID for focus/kill/keystroke support.
-pub(crate) fn spawn_piped(launcher: AppLauncher) -> Result<(crate::PipedAppHandle, crate::PipedOutput)> {
-    let path = &launcher.path;
+fn spawn_piped(cmd: &mut Command) -> Result<crate::Child> {
+    let path = &cmd.path;
 
     if !path.exists() {
         return Err(Error::NotFound(path.display().to_string()));
@@ -281,23 +306,23 @@ pub(crate) fn spawn_piped(launcher: AppLauncher) -> Result<(crate::PipedAppHandl
     let (stderr_master, stderr_slave_path) = create_pty()?;
 
     // Build open command: open -n -g -j -a <bundle> --stdout <pty> --stderr <pty> --args <args...>
-    let mut cmd = std::process::Command::new("/usr/bin/open");
-    cmd.arg("-n"); // always create new instance
-    if launcher.background {
-        cmd.args(["-g", "-j"]);
+    let mut open_cmd = std::process::Command::new("/usr/bin/open");
+    open_cmd.arg("-n"); // always create new instance
+    if cmd.background {
+        open_cmd.args(["-g", "-j"]);
     }
-    cmd.arg("-a").arg(&bundle_path);
-    cmd.arg("--stdout").arg(&stdout_slave_path);
-    cmd.arg("--stderr").arg(&stderr_slave_path);
-    if !launcher.args.is_empty() {
-        cmd.arg("--args");
-        cmd.args(&launcher.args);
+    open_cmd.arg("-a").arg(&bundle_path);
+    open_cmd.arg("--stdout").arg(&stdout_slave_path);
+    open_cmd.arg("--stderr").arg(&stderr_slave_path);
+    if !cmd.args.is_empty() {
+        open_cmd.arg("--args");
+        open_cmd.args(&cmd.args);
     }
-    cmd.stdout(std::process::Stdio::null());
-    cmd.stderr(std::process::Stdio::piped());
+    open_cmd.stdout(std::process::Stdio::null());
+    open_cmd.stderr(std::process::Stdio::piped());
 
 
-    let mut open_child = cmd.spawn()
+    let mut open_child = open_cmd.spawn()
         .map_err(|e| Error::Platform(format!("failed to spawn open: {e}")))?;
 
     // Wait for open to finish and check for errors
@@ -337,7 +362,7 @@ pub(crate) fn spawn_piped(launcher: AppLauncher) -> Result<(crate::PipedAppHandl
     let app = NSRunningApplication::runningApplicationWithProcessIdentifier(pid as i32);
 
     // Hide app if background mode — prevents Dock icon from appearing
-    if launcher.background {
+    if cmd.background {
         if let Some(ref app) = app {
             app.hide();
         }
@@ -352,15 +377,12 @@ pub(crate) fn spawn_piped(launcher: AppLauncher) -> Result<(crate::PipedAppHandl
     crate::start_drain_thread(stdout_master, stdout_tx);
     crate::start_drain_thread(stderr_master, stderr_tx);
 
-    let handle = crate::PipedAppHandle {
+    Ok(crate::Child {
         pid,
+        stdout: Some(crate::make_child_stdout(stdout_rx)),
+        stderr: Some(crate::make_child_stderr(stderr_rx)),
         inner,
-    };
-    let output = crate::PipedOutput {
-        stdout: Some(stdout_rx),
-        stderr: Some(stderr_rx),
-    };
-    Ok((handle, output))
+    })
 }
 
 /// Create a pty pair and return (master File, slave device path).
@@ -418,40 +440,6 @@ fn bundle_id_from_path(bundle_path: &std::path::Path) -> Option<String> {
     let start = after.find("<string>")? + 8;
     let end = after[start..].find("</string>")?;
     Some(after[start..start + end].to_string())
-}
-
-/// Resolve the executable binary path from either:
-/// - A direct binary path (returned as-is)
-/// - An .app bundle path (resolves to Contents/MacOS/<name>)
-fn find_binary(path: &std::path::Path) -> Option<std::path::PathBuf> {
-    // If it's already a file (not a directory), it's the binary
-    if path.is_file() {
-        return Some(path.to_path_buf());
-    }
-
-    // If it's an .app bundle, find the binary inside
-    if path.extension().is_some_and(|e| e == "app") {
-        let macos_dir = path.join("Contents").join("MacOS");
-        if macos_dir.is_dir() {
-            // Use the bundle name (without .app) as the binary name
-            let name = path.file_stem()?;
-            let binary = macos_dir.join(name);
-            if binary.is_file() {
-                return Some(binary);
-            }
-            // Fallback: first executable in the MacOS dir
-            if let Ok(entries) = std::fs::read_dir(&macos_dir) {
-                for entry in entries.flatten() {
-                    let p = entry.path();
-                    if p.is_file() {
-                        return Some(p);
-                    }
-                }
-            }
-        }
-    }
-
-    None
 }
 
 /// Walk up from a binary path to find the .app bundle directory.

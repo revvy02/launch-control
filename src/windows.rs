@@ -1,13 +1,15 @@
 use crate::error::{Error, Result};
-use crate::AppLauncher;
+use crate::Command;
 
+use std::io;
 use std::mem;
+use std::process::ExitStatus;
 use std::ptr;
 
-use windows_sys::Win32::Foundation::{CloseHandle, BOOL, HANDLE, HWND, WAIT_TIMEOUT};
+use windows_sys::Win32::Foundation::{CloseHandle, BOOL, HANDLE, HWND, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::System::Threading::{
-    CreateProcessW, TerminateProcess, WaitForSingleObject, PROCESS_INFORMATION, STARTF_USESHOWWINDOW,
-    STARTUPINFOW,
+    CreateProcessW, GetExitCodeProcess, TerminateProcess, WaitForSingleObject,
+    PROCESS_INFORMATION, STARTF_USESHOWWINDOW, STARTUPINFOW, INFINITE,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetWindowThreadProcessId, SW_SHOWNORMAL, SW_SHOWMINNOACTIVE,
@@ -25,14 +27,7 @@ unsafe impl Send for WindowsHandle {}
 unsafe impl Sync for WindowsHandle {}
 
 impl WindowsHandle {
-    pub fn is_running(&self) -> bool {
-        unsafe { WaitForSingleObject(self.process_handle, 0) == WAIT_TIMEOUT }
-    }
-
     pub fn focus(&self) -> Result<()> {
-        if !self.is_running() {
-            return Err(Error::Terminated);
-        }
         let hwnd = find_window_by_pid(self.pid)
             .ok_or_else(|| Error::Platform("no window found for process".into()))?;
 
@@ -43,15 +38,37 @@ impl WindowsHandle {
         Ok(())
     }
 
-    pub fn kill(&self) -> Result<()> {
-        if !self.is_running() {
-            return Ok(());
+    /// Kill returning io::Error (for Child::kill compatibility).
+    pub fn kill_io(&self) -> io::Result<()> {
+        // Check if still running first
+        let wait_result = unsafe { WaitForSingleObject(self.process_handle, 0) };
+        if wait_result != WAIT_TIMEOUT {
+            return Ok(()); // already dead
         }
         let ok = unsafe { TerminateProcess(self.process_handle, 1) };
         if ok == 0 {
-            Err(Error::Platform("TerminateProcess failed".into()))
+            Err(io::Error::new(io::ErrorKind::Other, "TerminateProcess failed"))
         } else {
             Ok(())
+        }
+    }
+
+    /// Check if the process has exited. Returns ExitStatus if exited.
+    pub fn try_wait(&self) -> io::Result<Option<ExitStatus>> {
+        let wait_result = unsafe { WaitForSingleObject(self.process_handle, 0) };
+        if wait_result == WAIT_TIMEOUT {
+            return Ok(None); // still running
+        }
+        if wait_result == WAIT_OBJECT_0 {
+            let mut exit_code: u32 = 0;
+            let ok = unsafe { GetExitCodeProcess(self.process_handle, &mut exit_code) };
+            if ok == 0 {
+                return Err(io::Error::new(io::ErrorKind::Other, "GetExitCodeProcess failed"));
+            }
+            // On Windows, ExitStatus wraps a u32 exit code
+            Ok(Some(unsafe { std::mem::transmute::<u32, ExitStatus>(exit_code) }))
+        } else {
+            Err(io::Error::new(io::ErrorKind::Other, "WaitForSingleObject failed"))
         }
     }
 }
@@ -64,15 +81,15 @@ impl Drop for WindowsHandle {
     }
 }
 
-pub(crate) fn spawn(launcher: AppLauncher) -> Result<crate::AppHandle> {
-    let exe_path = &launcher.path;
+pub(crate) fn spawn(cmd: &mut Command) -> Result<crate::Child> {
+    let exe_path = &cmd.path;
     if !exe_path.exists() {
         return Err(Error::NotFound(exe_path.display().to_string()));
     }
 
     // Build command line: "exe_path" arg1 arg2 ...
     let mut cmd_line = format!("\"{}\"", exe_path.display());
-    for arg in &launcher.args {
+    for arg in &cmd.args {
         cmd_line.push(' ');
         if arg.contains(' ') || arg.contains('"') {
             cmd_line.push('"');
@@ -90,7 +107,7 @@ pub(crate) fn spawn(launcher: AppLauncher) -> Result<crate::AppHandle> {
     let mut si: STARTUPINFOW = unsafe { mem::zeroed() };
     si.cb = mem::size_of::<STARTUPINFOW>() as u32;
     si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = if launcher.background {
+    si.wShowWindow = if cmd.background {
         SW_SHOWMINNOACTIVE as u16
     } else {
         SW_SHOWNORMAL as u16
@@ -124,8 +141,10 @@ pub(crate) fn spawn(launcher: AppLauncher) -> Result<crate::AppHandle> {
 
     let pid = pi.dwProcessId;
 
-    Ok(crate::AppHandle {
+    Ok(crate::Child {
         pid,
+        stdout: None,
+        stderr: None,
         inner: WindowsHandle {
             process_handle: pi.hProcess,
             pid,

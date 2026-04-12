@@ -1,4 +1,5 @@
 use std::fmt;
+use std::io;
 
 #[derive(Debug)]
 pub enum Error {
@@ -24,5 +25,16 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+impl From<Error> for io::Error {
+    fn from(err: Error) -> io::Error {
+        match err {
+            Error::NotFound(path) => io::Error::new(io::ErrorKind::NotFound, path),
+            Error::Platform(msg) => io::Error::new(io::ErrorKind::Other, msg),
+            Error::Terminated => io::Error::new(io::ErrorKind::BrokenPipe, "application has terminated"),
+            Error::Unsupported => io::Error::new(io::ErrorKind::Unsupported, "operation not supported on this platform"),
+        }
+    }
+}
 
 pub type Result<T> = std::result::Result<T, Error>;
