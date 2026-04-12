@@ -7,6 +7,7 @@ license = "MIT"
 repository = "https://github.com/revvy02/launch-control"
 
 [dependencies]
+keyboard-types = "0.7"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

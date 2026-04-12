@@ -36,6 +36,7 @@ mod macos;
 mod windows;
 
 pub use error::{Error, Result};
+pub use keyboard_types::{Code, Modifiers};
 
 use std::ffi::OsStr;
 use std::io::{self, BufRead, BufReader, Read};
@@ -219,23 +220,26 @@ impl Child {
         }
     }
 
-    /// Send Cmd+S (macOS) or Ctrl+S (Windows) directly to the process.
-    /// Does not require the app to be focused.
-    pub fn send_save_keystroke(&self) -> Result<()> {
+    /// Send a keystroke to the process. Does not require the app to be focused.
+    ///
+    /// Uses `CGEventPostToPSN` on macOS to post directly to the process's event queue.
+    pub fn send_keystroke(&self, code: Code, modifiers: Modifiers) -> Result<()> {
         #[cfg(target_os = "macos")]
         {
             return match self.inner {
-                Some(ref inner) => inner.send_cmd_s(),
+                Some(ref inner) => inner.send_keystroke(code, modifiers),
                 None => Err(Error::Platform("no GUI handle available".into())),
             };
         }
         #[cfg(target_os = "windows")]
         {
             // TODO: Use SendMessage/PostMessage for PID-targeted keystroke on Windows
+            let _ = (code, modifiers);
             return Err(Error::Unsupported);
         }
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
+            let _ = (code, modifiers);
             Err(Error::Unsupported)
         }
     }

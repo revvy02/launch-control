@@ -39,10 +39,13 @@ impl MacOSHandle {
         Ok(())
     }
 
-    /// Send Cmd+S keystroke directly to this process without requiring focus.
+    /// Send a keystroke directly to this process without requiring focus.
     /// Uses CGEventPostToPSN to post keyboard events to the process's event queue.
-    pub fn send_cmd_s(&self) -> Result<()> {
-        send_keystroke_to_pid(self.pid, 1, CGEventFlags::COMMAND) // keycode 1 = 'S'
+    pub fn send_keystroke(&self, code: keyboard_types::Code, modifiers: keyboard_types::Modifiers) -> Result<()> {
+        let keycode = code_to_macos_keycode(code)
+            .ok_or_else(|| Error::Platform(format!("unsupported key: {code:?}")))?;
+        let flags = modifiers_to_cg_flags(modifiers);
+        send_keystroke_to_pid(self.pid, keycode, flags)
     }
 }
 
@@ -62,8 +65,6 @@ mod cg_ffi {
     }
 
     pub type CGEventFlags = u64;
-    pub const kCGEventFlagMaskCommand: CGEventFlags = 0x100000;
-
     pub type CGKeyCode = u16;
 
     unsafe extern "C" {
@@ -89,9 +90,45 @@ mod cg_ffi {
     }
 }
 
-struct CGEventFlags;
-impl CGEventFlags {
-    const COMMAND: u64 = cg_ffi::kCGEventFlagMaskCommand;
+/// Map keyboard_types::Code to macOS virtual keycodes.
+fn code_to_macos_keycode(code: keyboard_types::Code) -> Option<u16> {
+    use keyboard_types::Code::*;
+    Some(match code {
+        KeyA => 0, KeyS => 1, KeyD => 2, KeyF => 3, KeyH => 4, KeyG => 5,
+        KeyZ => 6, KeyX => 7, KeyC => 8, KeyV => 9, KeyB => 11, KeyQ => 12,
+        KeyW => 13, KeyE => 14, KeyR => 15, KeyY => 16, KeyT => 17, KeyO => 31,
+        KeyU => 32, KeyI => 34, KeyP => 35, KeyL => 37, KeyJ => 38, KeyK => 40,
+        KeyN => 45, KeyM => 46,
+        Enter => 36, Tab => 48, Space => 49, Backspace => 51, Escape => 53,
+        Digit1 => 18, Digit2 => 19, Digit3 => 20, Digit4 => 21, Digit5 => 23,
+        Digit6 => 22, Digit7 => 26, Digit8 => 28, Digit9 => 25, Digit0 => 29,
+        Minus => 27, Equal => 24, BracketLeft => 33, BracketRight => 30,
+        Backslash => 42, Semicolon => 41, Quote => 39, Backquote => 50,
+        Comma => 43, Period => 47, Slash => 44,
+        F1 => 122, F2 => 120, F3 => 99, F4 => 118, F5 => 96, F6 => 97,
+        F7 => 98, F8 => 100, F9 => 101, F10 => 109, F11 => 103, F12 => 111,
+        ArrowLeft => 123, ArrowRight => 124, ArrowDown => 125, ArrowUp => 126,
+        Home => 115, End => 119, PageUp => 116, PageDown => 121, Delete => 117,
+        _ => return None,
+    })
+}
+
+/// Map keyboard_types::Modifiers to macOS CGEventFlags.
+fn modifiers_to_cg_flags(modifiers: keyboard_types::Modifiers) -> u64 {
+    let mut flags: u64 = 0;
+    if modifiers.contains(keyboard_types::Modifiers::META) {
+        flags |= 0x100000; // kCGEventFlagMaskCommand
+    }
+    if modifiers.contains(keyboard_types::Modifiers::SHIFT) {
+        flags |= 0x020000; // kCGEventFlagMaskShift
+    }
+    if modifiers.contains(keyboard_types::Modifiers::ALT) {
+        flags |= 0x080000; // kCGEventFlagMaskAlternate
+    }
+    if modifiers.contains(keyboard_types::Modifiers::CONTROL) {
+        flags |= 0x040000; // kCGEventFlagMaskControl
+    }
+    flags
 }
 
 fn send_keystroke_to_pid(pid: u32, keycode: u16, flags: u64) -> Result<()> {
