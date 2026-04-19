@@ -141,16 +141,21 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<crate::Child> {
 
     let pid = pi.dwProcessId;
 
+    let exit_state = std::sync::Arc::new(std::sync::Mutex::new(crate::ExitState::default()));
+    crate::start_exit_watcher(pid, exit_state.clone());
+
     Ok(crate::Child {
         pid,
         stdout: None,
         stderr: None,
+        exit_state,
         inner: WindowsHandle {
             process_handle: pi.hProcess,
             pid,
         },
     })
 }
+
 
 /// Find the first top-level window belonging to the given PID.
 fn find_window_by_pid(target_pid: u32) -> Option<HWND> {

@@ -196,6 +196,7 @@ fn make_exit_status(code: i32) -> ExitStatus {
     unsafe { std::mem::transmute::<i32, ExitStatus>(wait_status) }
 }
 
+
 /// Single spawn function — handles both piped and non-piped based on Command's stdio config.
 pub(crate) fn spawn(cmd: &mut Command) -> Result<crate::Child> {
     let path = &cmd.path;
@@ -300,10 +301,14 @@ fn spawn_simple(cmd: &mut Command) -> Result<crate::Child> {
         result.hide();
     }
 
+    let exit_state = std::sync::Arc::new(std::sync::Mutex::new(crate::ExitState::default()));
+    crate::start_exit_watcher(pid as u32, exit_state.clone());
+
     Ok(crate::Child {
         pid: pid as u32,
         stdout: None,
         stderr: None,
+        exit_state,
         inner: Some(MacOSHandle { app: result, pid: pid as u32 }),
     })
 }
@@ -414,10 +419,14 @@ fn spawn_piped(cmd: &mut Command) -> Result<crate::Child> {
     crate::start_drain_thread(stdout_master, stdout_tx);
     crate::start_drain_thread(stderr_master, stderr_tx);
 
+    let exit_state = std::sync::Arc::new(std::sync::Mutex::new(crate::ExitState::default()));
+    crate::start_exit_watcher(pid, exit_state.clone());
+
     Ok(crate::Child {
         pid,
         stdout: Some(crate::make_child_stdout(stdout_rx)),
         stderr: Some(crate::make_child_stderr(stderr_rx)),
+        exit_state,
         inner,
     })
 }

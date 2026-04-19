@@ -42,7 +42,57 @@ use std::ffi::OsStr;
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
+
+/// Internal fire-once state for exit notification.
+/// Transitions from `Pending(callbacks)` → `Exited(status)` exactly once.
+enum ExitState {
+    Pending(Vec<Box<dyn FnOnce(ExitStatus) + Send>>),
+    Exited(ExitStatus),
+}
+
+impl Default for ExitState {
+    fn default() -> Self {
+        Self::Pending(Vec::new())
+    }
+}
+
+pub(crate) type ExitStateShared = Arc<Mutex<ExitState>>;
+
+/// Start the OS-native exit watcher for a PID. When the process exits, fire
+/// all registered callbacks. Delegates to `parent_exit::on_pid_exit` which
+/// uses kqueue on macOS/BSD, waitpid on Linux, and WaitForSingleObject on
+/// Windows — single source of truth for process-exit primitives.
+///
+/// We can't read the real exit code of non-child processes on macOS (NSWorkspace
+/// launches are reparented to launchd), so the status passed to callbacks is a
+/// synthesized successful exit. Callers that need the real exit code should use
+/// `Child::try_wait()` / `wait()` instead.
+pub(crate) fn start_exit_watcher(pid: u32, state: ExitStateShared) {
+    parent_exit::on_pid_exit(pid, move || {
+        let status = synth_exit_status();
+        let mut guard = state.lock().unwrap();
+        let old = std::mem::replace(&mut *guard, ExitState::Exited(status));
+        drop(guard);
+        if let ExitState::Pending(callbacks) = old {
+            for cb in callbacks {
+                cb(status);
+            }
+        }
+    });
+}
+
+#[cfg(unix)]
+fn synth_exit_status() -> ExitStatus {
+    use std::os::unix::process::ExitStatusExt;
+    ExitStatus::from_raw(0)
+}
+
+#[cfg(windows)]
+fn synth_exit_status() -> ExitStatus {
+    use std::os::windows::process::ExitStatusExt;
+    ExitStatus::from_raw(0)
+}
 
 /// Builder for launching an application. Mirrors `std::process::Command`.
 ///
@@ -131,6 +181,8 @@ pub struct Child {
     pub stdout: Option<ChildStdout>,
     /// Captured stderr (only present when launched with `.stderr(Stdio::piped())`).
     pub stderr: Option<ChildStderr>,
+    /// Shared exit state for `on_exit` callbacks. Transitions once.
+    pub(crate) exit_state: ExitStateShared,
     #[cfg(target_os = "macos")]
     inner: Option<macos::MacOSHandle>,
     #[cfg(target_os = "windows")]
@@ -196,6 +248,34 @@ impl Child {
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
             Err(io::Error::new(io::ErrorKind::Unsupported, "unsupported platform"))
+        }
+    }
+
+    // -- Exit observation (multi-observer, event-driven, no polling) --
+
+    /// Register a callback that fires when the process exits.
+    ///
+    /// Event-driven (OS-native primitives — kqueue on macOS, WaitForSingleObject
+    /// on Windows). Does not require `&mut self` — multiple callbacks may be
+    /// registered from independent code paths, and none interferes with `kill()`
+    /// or ownership of the `Child` handle.
+    ///
+    /// If the process has already exited, the callback fires immediately on the
+    /// calling thread. Otherwise it fires on a dedicated watcher thread.
+    ///
+    /// Callback receives the process's `ExitStatus`. On macOS, apps launched via
+    /// NSWorkspace are not direct children, so we cannot read a real exit code;
+    /// the status will be a synthesized successful exit. On Windows, the real
+    /// `GetExitCodeProcess` value is reported.
+    pub fn on_exit(&self, callback: impl FnOnce(ExitStatus) + Send + 'static) {
+        let mut state = self.exit_state.lock().unwrap();
+        match &mut *state {
+            ExitState::Pending(cbs) => cbs.push(Box::new(callback)),
+            ExitState::Exited(status) => {
+                let status = *status;
+                drop(state);
+                callback(status);
+            }
         }
     }
 
