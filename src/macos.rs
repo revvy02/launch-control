@@ -11,6 +11,7 @@ use objc2_foundation::{NSArray, NSString, NSURL};
 use std::io;
 use std::process::ExitStatus;
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 /// macOS-specific handle wrapping NSRunningApplication.
 pub(crate) struct MacOSHandle {
@@ -49,30 +50,17 @@ impl MacOSHandle {
     }
 }
 
-// CoreGraphics / Carbon FFI for CGEventPostToPSN
+// CoreGraphics FFI for CGEventPostToPid.
 #[allow(non_camel_case_types, non_upper_case_globals, dead_code)]
 mod cg_ffi {
     use std::ffi::c_void;
 
     pub type CGEventRef = *mut c_void;
     pub type CGEventSourceRef = *mut c_void;
-
-    #[repr(C)]
-    #[derive(Debug, Copy, Clone)]
-    pub struct ProcessSerialNumber {
-        pub high: u32,
-        pub low: u32,
-    }
-
     pub type CGEventFlags = u64;
     pub type CGKeyCode = u16;
 
     unsafe extern "C" {
-        pub fn GetProcessForPID(
-            pid: libc::pid_t,
-            psn: *mut ProcessSerialNumber,
-        ) -> i32; // OSStatus
-
         pub fn CGEventCreateKeyboardEvent(
             source: CGEventSourceRef,
             virtual_key: CGKeyCode,
@@ -81,10 +69,12 @@ mod cg_ffi {
 
         pub fn CGEventSetFlags(event: CGEventRef, flags: CGEventFlags);
 
-        pub fn CGEventPostToPSN(
-            psn: *mut ProcessSerialNumber,
-            event: CGEventRef,
-        );
+        // Post a CGEvent to a specific process by PID. macOS 10.11+.
+        // Preferred over CGEventPostToPSN which requires a Carbon PSN lookup
+        // via GetProcessForPID — both deprecated, and the PSN path fails for
+        // background-launched processes that haven't registered with Launch
+        // Services yet.
+        pub fn CGEventPostToPid(pid: libc::pid_t, event: CGEventRef);
 
         pub fn CFRelease(cf: *mut c_void);
     }
@@ -134,22 +124,21 @@ fn modifiers_to_cg_flags(modifiers: keyboard_types::Modifiers) -> u64 {
 fn send_keystroke_to_pid(pid: u32, keycode: u16, flags: u64) -> Result<()> {
     use cg_ffi::*;
 
+    // CGEventPostToPid (macOS 10.11+) instead of the deprecated
+    // GetProcessForPID + CGEventPostToPSN pair. PostToPSN requires the
+    // Carbon LaunchServices database to have registered the target process,
+    // which has a delay for freshly-launched background apps — fails with
+    // OSStatus -600 (procNotFound) for very young Studio processes. PostToPid
+    // uses the kernel process table directly and is reliable from process
+    // creation onward. Same per-process event-queue delivery semantics.
     unsafe {
-        let mut psn = ProcessSerialNumber { high: 0, low: 0 };
-        let status = GetProcessForPID(pid as libc::pid_t, &mut psn);
-        if status != 0 {
-            return Err(Error::Platform(format!(
-                "GetProcessForPID failed for pid {pid}: OSStatus {status}"
-            )));
-        }
-
         // Key down
         let key_down = CGEventCreateKeyboardEvent(std::ptr::null_mut(), keycode, true);
         if key_down.is_null() {
             return Err(Error::Platform("failed to create key-down event".into()));
         }
         CGEventSetFlags(key_down, flags);
-        CGEventPostToPSN(&mut psn, key_down);
+        CGEventPostToPid(pid as libc::pid_t, key_down);
         CFRelease(key_down);
 
         // Key up
@@ -158,7 +147,7 @@ fn send_keystroke_to_pid(pid: u32, keycode: u16, flags: u64) -> Result<()> {
             return Err(Error::Platform("failed to create key-up event".into()));
         }
         CGEventSetFlags(key_up, flags);
-        CGEventPostToPSN(&mut psn, key_up);
+        CGEventPostToPid(pid as libc::pid_t, key_up);
         CFRelease(key_up);
     }
 

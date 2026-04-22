@@ -5,6 +5,7 @@ use std::io;
 use std::mem;
 use std::process::ExitStatus;
 use std::ptr;
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{CloseHandle, BOOL, HANDLE, HWND, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::System::Threading::{
@@ -12,7 +13,7 @@ use windows_sys::Win32::System::Threading::{
     PROCESS_INFORMATION, STARTF_USESHOWWINDOW, STARTUPINFOW, INFINITE,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindowThreadProcessId, SW_SHOWNORMAL, SW_SHOWMINNOACTIVE,
+    EnumWindows, GetForegroundWindow, GetWindowThreadProcessId, SW_SHOWNORMAL, SW_SHOWMINNOACTIVE,
     SetForegroundWindow, ShowWindow,
 };
 
@@ -31,11 +32,64 @@ impl WindowsHandle {
         let hwnd = find_window_by_pid(self.pid)
             .ok_or_else(|| Error::Platform("no window found for process".into()))?;
 
-        unsafe {
-            ShowWindow(hwnd, SW_SHOWNORMAL);
-            SetForegroundWindow(hwnd);
+        // Re-request foreground every tick. SetForegroundWindow can silently
+        // fail under Windows's focus-stealing-prevention heuristics or when
+        // other processes are competing for focus. Repeat until
+        // GetForegroundWindow confirms our pid owns it.
+        //
+        // Menu shortcuts (Ctrl+S, etc.) need our window to be foreground;
+        // callers that follow focus() with send_keystroke depend on this.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let started = Instant::now();
+        let mut ticks = 0u32;
+        loop {
+            unsafe {
+                ShowWindow(hwnd, SW_SHOWNORMAL);
+                SetForegroundWindow(hwnd);
+            }
+            let front_pid: u32 = unsafe {
+                let front_hwnd = GetForegroundWindow();
+                if !front_hwnd.is_null() {
+                    let mut pid: u32 = 0;
+                    GetWindowThreadProcessId(front_hwnd, &mut pid);
+                    pid
+                } else {
+                    0
+                }
+            };
+            if front_pid == self.pid {
+                tracing::debug!(
+                    pid = self.pid,
+                    ticks,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "focus: confirmed foreground",
+                );
+                return Ok(());
+            }
+            ticks += 1;
+            if ticks % 5 == 0 {
+                tracing::debug!(
+                    target_pid = self.pid,
+                    front_pid,
+                    ticks,
+                    "focus: still waiting, another process is foreground",
+                );
+            }
+            if Instant::now() >= deadline {
+                tracing::warn!(
+                    target_pid = self.pid,
+                    front_pid,
+                    ticks,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "focus: gave up after 5s, another process holds foreground",
+                );
+                return Err(Error::Platform(format!(
+                    "focus: pid {} not foreground after 5s (foreground was pid {})",
+                    self.pid, front_pid
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(100));
         }
-        Ok(())
     }
 
     /// Kill returning io::Error (for Child::kill compatibility).
