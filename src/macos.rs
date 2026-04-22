@@ -50,7 +50,7 @@ impl MacOSHandle {
     }
 }
 
-// CoreGraphics FFI for CGEventPostToPid.
+// CoreGraphics FFI for posting keyboard events.
 #[allow(non_camel_case_types, non_upper_case_globals, dead_code)]
 mod cg_ffi {
     use std::ffi::c_void;
@@ -59,6 +59,15 @@ mod cg_ffi {
     pub type CGEventSourceRef = *mut c_void;
     pub type CGEventFlags = u64;
     pub type CGKeyCode = u16;
+
+    // CGEventTapLocation values — where the event enters the event stream.
+    // kCGSessionEventTap (1) is the window-server session queue; NSApp of the
+    // frontmost app drains it continuously, which is why synthetic Cmd+S via
+    // this path triggers Qt shortcuts even when the app was already Active.
+    pub const K_CG_HID_EVENT_TAP: u32 = 0;
+    pub const K_CG_SESSION_EVENT_TAP: u32 = 1;
+    #[allow(dead_code)]
+    pub const K_CG_ANNOTATED_SESSION_EVENT_TAP: u32 = 2;
 
     unsafe extern "C" {
         pub fn CGEventCreateKeyboardEvent(
@@ -69,14 +78,34 @@ mod cg_ffi {
 
         pub fn CGEventSetFlags(event: CGEventRef, flags: CGEventFlags);
 
+        // Post to the session event tap — same path hardware events take.
+        // Routes to whichever app is currently frontmost. Use this when the
+        // target is already frontmost so NSApp's normal event pump delivers
+        // the event (vs CGEventPostToPid which writes to the target's private
+        // Carbon queue, drained by Qt only on inactive→active transitions).
+        pub fn CGEventPost(tap: u32, event: CGEventRef);
+
         // Post a CGEvent to a specific process by PID. macOS 10.11+.
         // Preferred over CGEventPostToPSN which requires a Carbon PSN lookup
         // via GetProcessForPID — both deprecated, and the PSN path fails for
         // background-launched processes that haven't registered with Launch
-        // Services yet.
+        // Services yet. The trade-off: events land in the target's private
+        // Carbon queue, which Qt only drains on activation-state transitions,
+        // so this is unreliable when the target is already frontmost.
         pub fn CGEventPostToPid(pid: libc::pid_t, event: CGEventRef);
 
         pub fn CFRelease(cf: *mut c_void);
+    }
+}
+
+/// Returns true if the given PID is currently the frontmost application
+/// according to NSWorkspace. Used to pick between `CGEventPost` (for
+/// frontmost targets) and `CGEventPostToPid` (for everything else).
+fn is_pid_frontmost(pid: u32) -> bool {
+    let workspace = NSWorkspace::sharedWorkspace();
+    match workspace.frontmostApplication() {
+        Some(app) => app.processIdentifier() == pid as libc::pid_t,
+        None => false,
     }
 }
 
@@ -124,30 +153,48 @@ fn modifiers_to_cg_flags(modifiers: keyboard_types::Modifiers) -> u64 {
 fn send_keystroke_to_pid(pid: u32, keycode: u16, flags: u64) -> Result<()> {
     use cg_ffi::*;
 
-    // CGEventPostToPid (macOS 10.11+) instead of the deprecated
-    // GetProcessForPID + CGEventPostToPSN pair. PostToPSN requires the
-    // Carbon LaunchServices database to have registered the target process,
-    // which has a delay for freshly-launched background apps — fails with
-    // OSStatus -600 (procNotFound) for very young Studio processes. PostToPid
-    // uses the kernel process table directly and is reliable from process
-    // creation onward. Same per-process event-queue delivery semantics.
+    // Route by frontmost-ness:
+    //
+    // - `CGEventPostToPid` writes to the target process's private Carbon
+    //   event queue. A Qt app only drains that queue on an inactive→active
+    //   transition, so posting here when the target is already frontmost
+    //   results in silently dropped events (observed: foreground Studio never
+    //   receiving Cmd+S).
+    // - `CGEventPost(kCGSessionEventTap)` posts to the window server's
+    //   session queue — the same queue hardware events take. NSApp of the
+    //   frontmost app drains it continuously, so a synthetic Cmd+S there
+    //   triggers shortcuts exactly like a real key press.
+    //
+    // Picked PostToPid for backgrounded targets because session-tap events
+    // only go to whichever app is frontmost; we'd otherwise send Cmd+S to
+    // the wrong app. Apple's own guidance (NSEvent docs): "CGEventPostToPSN
+    // if you want to target a specific process, or post to kCGSessionEventTap
+    // if you want to target the app with focus."
+    let frontmost = is_pid_frontmost(pid);
+
     unsafe {
-        // Key down
         let key_down = CGEventCreateKeyboardEvent(std::ptr::null_mut(), keycode, true);
         if key_down.is_null() {
             return Err(Error::Platform("failed to create key-down event".into()));
         }
         CGEventSetFlags(key_down, flags);
-        CGEventPostToPid(pid as libc::pid_t, key_down);
+        if frontmost {
+            CGEventPost(K_CG_SESSION_EVENT_TAP, key_down);
+        } else {
+            CGEventPostToPid(pid as libc::pid_t, key_down);
+        }
         CFRelease(key_down);
 
-        // Key up
         let key_up = CGEventCreateKeyboardEvent(std::ptr::null_mut(), keycode, false);
         if key_up.is_null() {
             return Err(Error::Platform("failed to create key-up event".into()));
         }
         CGEventSetFlags(key_up, flags);
-        CGEventPostToPid(pid as libc::pid_t, key_up);
+        if frontmost {
+            CGEventPost(K_CG_SESSION_EVENT_TAP, key_up);
+        } else {
+            CGEventPostToPid(pid as libc::pid_t, key_up);
+        }
         CFRelease(key_up);
     }
 
