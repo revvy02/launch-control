@@ -171,6 +171,17 @@ fn send_keystroke_to_pid(pid: u32, keycode: u16, flags: u64) -> Result<()> {
     // if you want to target a specific process, or post to kCGSessionEventTap
     // if you want to target the app with focus."
     let frontmost = is_pid_frontmost(pid);
+    let actual_frontmost_pid = {
+        let workspace = NSWorkspace::sharedWorkspace();
+        workspace.frontmostApplication().map(|a| a.processIdentifier() as u32)
+    };
+    tracing::info!(
+        pid,
+        frontmost,
+        actual_frontmost_pid = ?actual_frontmost_pid,
+        route = if frontmost { "session_tap" } else { "post_to_pid" },
+        "send_keystroke routing"
+    );
 
     unsafe {
         let key_down = CGEventCreateKeyboardEvent(std::ptr::null_mut(), keycode, true);
