@@ -10,8 +10,17 @@ use objc2_foundation::{NSArray, NSString, NSURL};
 
 use std::io;
 use std::process::ExitStatus;
-use std::sync::mpsc;
+use std::sync::{mpsc, Mutex};
 use std::time::{Duration, Instant};
+
+/// Serializes the snapshot → open → PID-claim window in `spawn_piped`.
+/// The lookup uses NSRunningApplication's bundle-ID set diff, which is
+/// inherently racy under concurrent spawns of the same bundle: multiple
+/// callers see the same "first new PID" and the rest are orphaned (never
+/// associated with any callback / Child handle). Holding this lock across
+/// the snapshot/launch/claim ensures each caller is paired with a unique
+/// new PID.
+static SPAWN_PIPED_LOCK: Mutex<()> = Mutex::new(());
 
 /// macOS-specific handle wrapping NSRunningApplication.
 pub(crate) struct MacOSHandle {
@@ -377,6 +386,10 @@ fn spawn_piped(cmd: &mut Command) -> Result<crate::Child> {
     let bundle_path = find_app_bundle(path)
         .ok_or_else(|| Error::NotFound(format!("no .app bundle found for {}", path.display())))?;
 
+    // Hold the spawn lock across the snapshot → open → PID-claim window.
+    // See SPAWN_PIPED_LOCK doc for why.
+    let _spawn_guard = SPAWN_PIPED_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
     // Snapshot existing PIDs for this bundle to detect the new one after launch
     let bundle_id = bundle_id_from_path(&bundle_path);
     let before_pids: Vec<i32> = if let Some(ref bid) = bundle_id {
@@ -447,6 +460,10 @@ fn spawn_piped(cmd: &mut Command) -> Result<crate::Child> {
     } else {
         return Err(Error::Platform("could not determine bundle ID for PID lookup".into()));
     };
+
+    // PID claimed — release the spawn lock. Subsequent setup (NSRunningApplication
+    // lookup, pty drain threads, exit watcher) doesn't need to be serialized.
+    drop(_spawn_guard);
 
     let app = NSRunningApplication::runningApplicationWithProcessIdentifier(pid as i32);
 
