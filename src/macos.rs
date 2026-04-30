@@ -394,10 +394,13 @@ fn spawn_piped(cmd: &mut Command) -> Result<crate::Child> {
     let bundle_id = bundle_id_from_path(&bundle_path)
         .ok_or_else(|| Error::Platform("could not determine bundle ID for PID lookup".into()))?;
 
-    // Find the helper binary: sibling to current_exe by default, or
-    // overridden via env var (useful when consumer's build deploys it
-    // alongside but renamed, or for tests).
-    let helper_bin = resolve_binary()?;
+    // Find the helper binary. Two modes (in priority order):
+    //   1. set_helper_invocation(bin, prefix_args) — caller-configured.
+    //      Used both for subcommand integration (bin = consumer's own
+    //      exe, prefix = ["__sub"]) and for embed-and-unpack (bin =
+    //      unpacked path, no prefix).
+    //   2. sibling-of-current_exe — standalone deployment.
+    let (helper_bin, helper_prefix) = resolve_helper()?;
 
     // Hold the spawn lock across the snapshot → spawn-helper → PID-claim
     // window. NSRunningApplication's set-diff is racy under concurrent spawns
@@ -412,6 +415,7 @@ fn spawn_piped(cmd: &mut Command) -> Result<crate::Child> {
     // Spawn the helper. The helper does the actual NSWorkspace+pty work
     // internally and forwards the app's stdio to its own stdout/stderr.
     let mut helper_cmd = std::process::Command::new(&helper_bin);
+    helper_cmd.args(&helper_prefix);
     helper_cmd.arg("--bundle").arg(&bundle_path);
     if cmd.background {
         helper_cmd.arg("--background");
@@ -428,7 +432,7 @@ fn spawn_piped(cmd: &mut Command) -> Result<crate::Child> {
     helper_cmd.stderr(std::process::Stdio::piped());
 
     let mut helper_child = helper_cmd.spawn()
-        .map_err(|e| Error::Platform(format!("failed to spawn launch-control helper ({}): {e}", helper_bin.display())))?;
+        .map_err(|e| Error::Platform(format!("failed to spawn launch-control helper ({} {}): {e}", helper_bin.display(), helper_prefix.join(" "))))?;
 
     // Find the new PID by diffing against the snapshot. The helper kicks off
     // `open` which spawns the app; the app is in NSRunningApplication's list
@@ -509,20 +513,25 @@ fn spawn_piped(cmd: &mut Command) -> Result<crate::Child> {
     })
 }
 
-/// Locate the `launch-control` helper binary. Override with the
-/// `LAUNCH_CONTROL_BIN` env var; otherwise look for it as a sibling of the
-/// current executable (typical layout: `bin/<consumer>` and
-/// `bin/launch-control` in the same directory).
-fn resolve_binary() -> Result<std::path::PathBuf> {
-    if let Ok(p) = std::env::var("LAUNCH_CONTROL_BIN") {
-        let path = std::path::PathBuf::from(p);
-        if path.exists() {
-            return Ok(path);
+/// Resolve how to invoke the helper. Returns `(binary, prefix_args)` so
+/// callers can run `<binary> <prefix_args...> <helper-flags...>`.
+///
+/// Priority:
+///   1. [`crate::set_helper_invocation`] — caller configured. Used for
+///      both subcommand integration (bin = consumer's exe, prefix = the
+///      hidden subcommand name) and embed-and-unpack (bin = unpacked
+///      path, prefix empty).
+///   2. Sibling-of-`current_exe` — `<dir-of-consumer-bin>/launch-control`,
+///      the typical "deploy the helper next to your binary" layout.
+fn resolve_helper() -> Result<(std::path::PathBuf, Vec<String>)> {
+    if let Some(inv) = crate::HELPER_INVOCATION.get() {
+        if !inv.bin.exists() {
+            return Err(Error::Platform(format!(
+                "configured helper bin does not exist: {}",
+                inv.bin.display()
+            )));
         }
-        return Err(Error::Platform(format!(
-            "LAUNCH_CONTROL_BIN points to non-existent path: {}",
-            path.display()
-        )));
+        return Ok((inv.bin.clone(), inv.prefix_args.clone()));
     }
     let exe = std::env::current_exe()
         .map_err(|e| Error::Platform(format!("current_exe failed: {e}")))?;
@@ -530,10 +539,10 @@ fn resolve_binary() -> Result<std::path::PathBuf> {
         .ok_or_else(|| Error::Platform("current_exe has no parent dir".into()))?;
     let candidate = dir.join("launch-control");
     if candidate.exists() {
-        return Ok(candidate);
+        return Ok((candidate, Vec::new()));
     }
     Err(Error::Platform(format!(
-        "launch-control helper not found at {} (set LAUNCH_CONTROL_BIN to override)",
+        "launch-control helper not found at {} (call set_helper_invocation, or deploy the binary as a sibling)",
         candidate.display()
     )))
 }
@@ -560,7 +569,7 @@ fn resolve_binary() -> Result<std::path::PathBuf> {
 ///      death, exit (which closes the pty masters → app gets SIGHUP → orderly
 ///      cascade kill).
 ///   5. Block on the drain threads. When both finish (app exited), exit 0.
-pub(crate) fn run_helper_main() -> ! {
+pub(crate) fn run_helper_main_with_args(args: impl Iterator<Item = String>) -> ! {
     // 1. Become our own session leader (`setsid`) so the helper is detached
     //    from the parent's session and process group. Without this, when the
     //    session leader (typically the shell / test runner that spawned the
@@ -582,7 +591,7 @@ pub(crate) fn run_helper_main() -> ! {
     let mut background = false;
     let mut detached = false;
     let mut app_args: Vec<String> = Vec::new();
-    let mut iter = std::env::args().skip(1);
+    let mut iter = args;
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--bundle" => {

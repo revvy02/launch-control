@@ -529,13 +529,30 @@ fn platform_spawn(_cmd: &mut Command) -> Result<Child> {
     Err(Error::Unsupported)
 }
 
-/// Entry point for the `launch-control` helper binary. Public only so the
-/// `[[bin]]` target can call it; not intended for direct use by other
-/// consumers — invoke `Command::spawn` instead, which dispatches through
-/// the helper internally.
+/// Entry point for the standalone `launch-control` helper binary. Parses
+/// args from `std::env::args().skip(1)` and dispatches to the helper main.
+///
+/// Most callers use one of three integration modes:
+///
+/// 1. **Standalone**: deploy the `[[bin]] launch-control` next to your
+///    binary; `Command::spawn` resolves it as a sibling of `current_exe`.
+///    No code change needed.
+///
+/// 2. **Subcommand** (recommended for multi-call binaries): expose a
+///    hidden subcommand in your own `main` that dispatches to
+///    [`run_main_with_args`], then call [`set_helper_invocation`] at
+///    startup to point launch-control at your binary + that subcommand.
+///    Single binary, no separate helper file.
+///
+/// 3. **Embed**: `include_bytes!` the helper at compile time, unpack to a
+///    cache dir at startup, then call [`set_helper_invocation`] with the
+///    unpacked path and empty prefix args. Single binary distribution
+///    without restructuring `main`.
+///
+/// `run_main` itself is for mode 1 — the `[[bin]]` target's `fn main`.
 #[cfg(target_os = "macos")]
 pub fn run_main() -> ! {
-    macos::run_helper_main()
+    run_main_with_args(std::env::args().skip(1))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -543,3 +560,53 @@ pub fn run_main() -> ! {
     eprintln!("launch-control: helper not supported on this platform");
     std::process::exit(2)
 }
+
+/// Same as [`run_main`] but takes the helper's args from an explicit
+/// iterator. Lets a consumer's `main` strip its own dispatch arg (e.g.
+/// the subcommand name) before handing the rest off to launch-control.
+///
+/// Diverges — does not return.
+#[cfg(target_os = "macos")]
+pub fn run_main_with_args(args: impl Iterator<Item = String>) -> ! {
+    macos::run_helper_main_with_args(args)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn run_main_with_args(_args: impl Iterator<Item = String>) -> ! {
+    eprintln!("launch-control: helper not supported on this platform");
+    std::process::exit(2)
+}
+
+/// Configure how `Command::spawn` invokes the helper subprocess. When
+/// set, spawning runs `<bin> <prefix_args...> <helper-flags...>` instead
+/// of looking for a sibling binary or honoring `LAUNCH_CONTROL_BIN`.
+///
+/// Use this to dispatch the helper as a subcommand of your own binary —
+/// see mode 2 in [`run_main`]'s doc. Call once at startup, before any
+/// `Command::spawn(...)`. First call wins; later calls are silently
+/// ignored.
+///
+/// # Example
+///
+/// ```no_run
+/// // In your `main`, before `Command::spawn`:
+/// let exe = std::env::current_exe()?;
+/// launch_control::set_helper_invocation(exe, vec!["__launch-control".into()]);
+///
+/// // And register the subcommand dispatch at the very top of `main`:
+/// if std::env::args().nth(1).as_deref() == Some("__launch-control") {
+///     launch_control::run_main_with_args(std::env::args().skip(2));
+/// }
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn set_helper_invocation(bin: std::path::PathBuf, prefix_args: Vec<String>) {
+    let _ = HELPER_INVOCATION.set(HelperInvocation { bin, prefix_args });
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct HelperInvocation {
+    pub(crate) bin: std::path::PathBuf,
+    pub(crate) prefix_args: Vec<String>,
+}
+
+pub(crate) static HELPER_INVOCATION: std::sync::OnceLock<HelperInvocation> = std::sync::OnceLock::new();
