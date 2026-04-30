@@ -24,6 +24,14 @@ default = []
 # was current at registration.
 tokio = ["dep:tokio"]
 
+# Helper binary that holds the launched app's pty FDs in a separate process
+# so the app can survive the calling process's death (`Command::detached(true)`).
+# Consumers must deploy this binary alongside their executable; launch-control
+# resolves it via `LAUNCH_CONTROL_BIN` env or sibling-of-current-exe.
+[[bin]]
+name = "launch-control"
+path = "src/bin/launch-control.rs"
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

@@ -133,6 +133,10 @@ pub struct Command {
     pub(crate) url: Option<String>,
     pub(crate) stdout_cfg: Option<Stdio>,
     pub(crate) stderr_cfg: Option<Stdio>,
+    /// When true, the launched app survives the calling process's death —
+    /// SIGKILL of the parent doesn't take the app with it. See
+    /// [`Command::detached`] for the platform-specific implementation notes.
+    pub(crate) detached: bool,
 }
 
 impl Command {
@@ -145,6 +149,7 @@ impl Command {
             url: None,
             stdout_cfg: None,
             stderr_cfg: None,
+            detached: false,
         }
     }
 
@@ -185,6 +190,24 @@ impl Command {
     /// Configure stderr handling. Use `Stdio::piped()` to capture output.
     pub fn stderr(&mut self, cfg: Stdio) -> &mut Self {
         self.stderr_cfg = Some(cfg);
+        self
+    }
+
+    /// Decouple the launched app from the calling process. When true, a SIGKILL
+    /// (or any other ungraceful exit) of the spawning process leaves the app
+    /// running. Mirrors `start_new_session=True` (Python) / `Setsid=true` (Go) /
+    /// `DETACHED_PROCESS` (Windows `CreateProcess`) — same idea, unified across
+    /// platforms.
+    ///
+    /// Stdio capture (`Stdio::piped()`) keeps working in detached mode on every
+    /// platform: implementation hides the platform-specific machinery
+    /// (wrapper process on macOS, native creation flag on Windows, `setsid` on
+    /// Linux).
+    ///
+    /// Explicit `Child::kill()` always kills the app regardless of this flag —
+    /// detached only governs implicit propagation when the parent dies.
+    pub fn detached(&mut self, detached: bool) -> &mut Self {
+        self.detached = detached;
         self
     }
 
@@ -504,4 +527,19 @@ fn platform_spawn(cmd: &mut Command) -> Result<Child> {
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn platform_spawn(_cmd: &mut Command) -> Result<Child> {
     Err(Error::Unsupported)
+}
+
+/// Entry point for the `launch-control` helper binary. Public only so the
+/// `[[bin]]` target can call it; not intended for direct use by other
+/// consumers — invoke `Command::spawn` instead, which dispatches through
+/// the helper internally.
+#[cfg(target_os = "macos")]
+pub fn run_main() -> ! {
+    macos::run_helper_main()
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn run_main() -> ! {
+    eprintln!("launch-control: helper not supported on this platform");
+    std::process::exit(2)
 }

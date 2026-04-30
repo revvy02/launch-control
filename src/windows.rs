@@ -169,6 +169,19 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<crate::Child> {
 
     let mut pi: PROCESS_INFORMATION = unsafe { mem::zeroed() };
 
+    // `Command::detached(true)` → DETACHED_PROCESS + CREATE_NEW_PROCESS_GROUP.
+    // DETACHED_PROCESS: child doesn't inherit the parent's console, so console
+    // teardown when parent dies doesn't propagate.
+    // CREATE_NEW_PROCESS_GROUP: child is in its own process group, so Ctrl+C/
+    // Ctrl+Break delivered to the parent group don't reach it.
+    const DETACHED_PROCESS: u32 = 0x00000008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+    let creation_flags: u32 = if cmd.detached {
+        DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    } else {
+        0
+    };
+
     let ok = unsafe {
         CreateProcessW(
             ptr::null(),
@@ -176,7 +189,7 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<crate::Child> {
             ptr::null(),
             ptr::null(),
             0, // bInheritHandles = FALSE
-            0, // dwCreationFlags
+            creation_flags,
             ptr::null(),
             ptr::null(),
             &si,

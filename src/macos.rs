@@ -369,12 +369,18 @@ fn spawn_simple(cmd: &mut Command) -> Result<crate::Child> {
     })
 }
 
-/// Spawn an application with piped stdout/stderr via `/usr/bin/open` + ptys.
+/// Spawn an application with piped stdout/stderr via the helper subprocess.
 ///
-/// Uses `open -g -j` for clean background launch (no focus steal, no Dock activation).
-/// Creates pseudo-terminal pairs for stdout/stderr — unlike FIFOs/pipes, ptys never
-/// SIGPIPE or block the writer, so the app can't hang regardless of reader state.
-/// Gets `NSRunningApplication` from PID for focus/kill/keystroke support.
+/// The helper (`launch-control`, this crate's binary target) holds the pty
+/// masters in its own process. This makes the launched app's stdio survive
+/// the calling process's death — for `Command::detached(true)`, when the
+/// caller dies, the helper survives and the app keeps running with stdio
+/// captured. For non-detached, the helper exits when its parent dies, the
+/// pty masters close, and the app receives SIGHUP and dies (orderly cascade).
+///
+/// Uses `open -g -j` (inside the helper) for clean background launch (no
+/// focus steal, no Dock activation). Returns an `NSRunningApplication`-backed
+/// `Child` for focus/kill/keystroke support.
 fn spawn_piped(cmd: &mut Command) -> Result<crate::Child> {
     let path = &cmd.path;
 
@@ -382,87 +388,82 @@ fn spawn_piped(cmd: &mut Command) -> Result<crate::Child> {
         return Err(Error::NotFound(path.display().to_string()));
     }
 
-    // Resolve to .app bundle (open requires bundle path)
+    // Resolve to .app bundle (the helper's `open` invocation requires it)
     let bundle_path = find_app_bundle(path)
         .ok_or_else(|| Error::NotFound(format!("no .app bundle found for {}", path.display())))?;
+    let bundle_id = bundle_id_from_path(&bundle_path)
+        .ok_or_else(|| Error::Platform("could not determine bundle ID for PID lookup".into()))?;
 
-    // Hold the spawn lock across the snapshot → open → PID-claim window.
-    // See SPAWN_PIPED_LOCK doc for why.
+    // Find the helper binary: sibling to current_exe by default, or
+    // overridden via env var (useful when consumer's build deploys it
+    // alongside but renamed, or for tests).
+    let helper_bin = resolve_binary()?;
+
+    // Hold the spawn lock across the snapshot → spawn-helper → PID-claim
+    // window. NSRunningApplication's set-diff is racy under concurrent spawns
+    // of the same bundle.
     let _spawn_guard = SPAWN_PIPED_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     // Snapshot existing PIDs for this bundle to detect the new one after launch
-    let bundle_id = bundle_id_from_path(&bundle_path);
-    let before_pids: Vec<i32> = if let Some(ref bid) = bundle_id {
-        NSRunningApplication::runningApplicationsWithBundleIdentifier(
-            &objc2_foundation::NSString::from_str(bid),
-        ).iter().map(|app| app.processIdentifier()).collect()
-    } else {
-        vec![]
-    };
+    let before_pids: Vec<i32> = NSRunningApplication::runningApplicationsWithBundleIdentifier(
+        &objc2_foundation::NSString::from_str(&bundle_id),
+    ).iter().map(|app| app.processIdentifier()).collect();
 
-
-    // Create pty pairs for stdout/stderr. Unlike FIFOs/pipes, ptys never
-    // send SIGPIPE or block the writer — if nobody reads, data is discarded.
-    // This prevents Studio from hanging/crashing regardless of our process state.
-    let (stdout_master, stdout_slave_path) = create_pty()?;
-    let (stderr_master, stderr_slave_path) = create_pty()?;
-
-    // Build open command: open -n -g -j -a <bundle> --stdout <pty> --stderr <pty> --args <args...>
-    let mut open_cmd = std::process::Command::new("/usr/bin/open");
-    open_cmd.arg("-n"); // always create new instance
+    // Spawn the helper. The helper does the actual NSWorkspace+pty work
+    // internally and forwards the app's stdio to its own stdout/stderr.
+    let mut helper_cmd = std::process::Command::new(&helper_bin);
+    helper_cmd.arg("--bundle").arg(&bundle_path);
     if cmd.background {
-        open_cmd.args(["-g", "-j"]);
+        helper_cmd.arg("--background");
     }
-    open_cmd.arg("-a").arg(&bundle_path);
-    open_cmd.arg("--stdout").arg(&stdout_slave_path);
-    open_cmd.arg("--stderr").arg(&stderr_slave_path);
+    if cmd.detached {
+        helper_cmd.arg("--detached");
+    }
     if !cmd.args.is_empty() {
-        open_cmd.arg("--args");
-        open_cmd.args(&cmd.args);
+        helper_cmd.arg("--");
+        helper_cmd.args(&cmd.args);
     }
-    open_cmd.stdout(std::process::Stdio::null());
-    open_cmd.stderr(std::process::Stdio::piped());
+    helper_cmd.stdin(std::process::Stdio::null());
+    helper_cmd.stdout(std::process::Stdio::piped());
+    helper_cmd.stderr(std::process::Stdio::piped());
 
+    let mut helper_child = helper_cmd.spawn()
+        .map_err(|e| Error::Platform(format!("failed to spawn launch-control helper ({}): {e}", helper_bin.display())))?;
 
-    let mut open_child = open_cmd.spawn()
-        .map_err(|e| Error::Platform(format!("failed to spawn open: {e}")))?;
-
-    // Wait for open to finish and check for errors
-    let open_status = open_child.wait()
-        .map_err(|e| Error::Platform(format!("failed to wait for open: {e}")))?;
-    if !open_status.success() {
-        let mut open_stderr = String::new();
-        if let Some(mut stderr) = open_child.stderr.take() {
-            use std::io::Read;
-            let _ = stderr.read_to_string(&mut open_stderr);
-        }
-        eprintln!("[launch-control] open failed: status={open_status}, stderr={open_stderr}");
-    }
-
-    // Find the new PID by diffing against the snapshot
-    let pid = if let Some(ref bid) = bundle_id {
-        (|| -> Option<u32> {
-            for _ in 0..20 {
-                let current = NSRunningApplication::runningApplicationsWithBundleIdentifier(
-                    &objc2_foundation::NSString::from_str(bid),
-                );
-                for app in current.iter() {
-                    let p = app.processIdentifier();
-                    if p > 0 && !before_pids.contains(&p) {
-                        return Some(p as u32);
-                    }
+    // Find the new PID by diffing against the snapshot. The helper kicks off
+    // `open` which spawns the app; the app is in NSRunningApplication's list
+    // shortly after.
+    let pid = (|| -> Option<u32> {
+        for _ in 0..50 {
+            let current = NSRunningApplication::runningApplicationsWithBundleIdentifier(
+                &objc2_foundation::NSString::from_str(&bundle_id),
+            );
+            for app in current.iter() {
+                let p = app.processIdentifier();
+                if p > 0 && !before_pids.contains(&p) {
+                    return Some(p as u32);
                 }
-                std::thread::sleep(std::time::Duration::from_millis(200));
             }
-            None
-        })()
-        .ok_or_else(|| Error::Platform("could not find launched app PID".into()))?
-    } else {
-        return Err(Error::Platform("could not determine bundle ID for PID lookup".into()));
-    };
+            // Helper bails fast on bad args; if it died before the app
+            // appears, give up rather than wait the full 10s.
+            if let Ok(Some(_status)) = helper_child.try_wait() {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        None
+    })()
+    .ok_or_else(|| {
+        // Drain helper stderr for diagnostics
+        let mut helper_stderr = String::new();
+        if let Some(mut stderr) = helper_child.stderr.take() {
+            use std::io::Read;
+            let _ = stderr.read_to_string(&mut helper_stderr);
+        }
+        Error::Platform(format!("helper failed to launch app: {helper_stderr}"))
+    })?;
 
-    // PID claimed — release the spawn lock. Subsequent setup (NSRunningApplication
-    // lookup, pty drain threads, exit watcher) doesn't need to be serialized.
+    // PID claimed — release the spawn lock.
     drop(_spawn_guard);
 
     let app = NSRunningApplication::runningApplicationWithProcessIdentifier(pid as i32);
@@ -476,15 +477,28 @@ fn spawn_piped(cmd: &mut Command) -> Result<crate::Child> {
 
     let inner = app.map(|app| MacOSHandle { app, pid });
 
-    // Drain threads read from pty master ends.
-    // If our process exits, master closes → slave gets EIO (not SIGPIPE) → app handles gracefully.
+    // Drain helper subprocess stdout/stderr (each carries the app's
+    // corresponding stream, forwarded by the helper's pty drain). These are
+    // real OS pipes between us and the helper — no pty involved at this
+    // layer, so we don't get SIGHUP'd if the helper dies later.
     let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
     let (stderr_tx, stderr_rx) = std::sync::mpsc::channel();
-    crate::start_drain_thread(stdout_master, stdout_tx);
-    crate::start_drain_thread(stderr_master, stderr_tx);
+    if let Some(stdout) = helper_child.stdout.take() {
+        crate::start_drain_thread(stdout, stdout_tx);
+    }
+    if let Some(stderr) = helper_child.stderr.take() {
+        crate::start_drain_thread(stderr, stderr_tx);
+    }
 
     let exit_state = std::sync::Arc::new(std::sync::Mutex::new(crate::ExitState::default()));
     crate::start_exit_watcher(pid, exit_state.clone());
+
+    // Forget the helper handle — we don't want std::process::Child::Drop
+    // killing the helper when this scope ends. Helper lifecycle is tied to
+    // the app's via parent-exit + pty SIGHUP; explicit Child::kill() on our
+    // returned handle goes via the app's NSRunningApplication, and the
+    // helper sees the app exit and tears itself down.
+    std::mem::forget(helper_child);
 
     Ok(crate::Child {
         pid,
@@ -493,6 +507,285 @@ fn spawn_piped(cmd: &mut Command) -> Result<crate::Child> {
         exit_state,
         inner,
     })
+}
+
+/// Locate the `launch-control` helper binary. Override with the
+/// `LAUNCH_CONTROL_BIN` env var; otherwise look for it as a sibling of the
+/// current executable (typical layout: `bin/<consumer>` and
+/// `bin/launch-control` in the same directory).
+fn resolve_binary() -> Result<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("LAUNCH_CONTROL_BIN") {
+        let path = std::path::PathBuf::from(p);
+        if path.exists() {
+            return Ok(path);
+        }
+        return Err(Error::Platform(format!(
+            "LAUNCH_CONTROL_BIN points to non-existent path: {}",
+            path.display()
+        )));
+    }
+    let exe = std::env::current_exe()
+        .map_err(|e| Error::Platform(format!("current_exe failed: {e}")))?;
+    let dir = exe.parent()
+        .ok_or_else(|| Error::Platform("current_exe has no parent dir".into()))?;
+    let candidate = dir.join("launch-control");
+    if candidate.exists() {
+        return Ok(candidate);
+    }
+    Err(Error::Platform(format!(
+        "launch-control helper not found at {} (set LAUNCH_CONTROL_BIN to override)",
+        candidate.display()
+    )))
+}
+
+/// Body of the `launch-control` helper binary. Lives here so it's testable
+/// lib code; the binary target is a 3-line shim that calls this.
+///
+/// Reads args:
+///   `--bundle <path>` (required) — `.app` bundle path
+///   `--background`               — pass `-g -j` to `open` (no focus steal)
+///   `--detached`                 — survive parent death (don't exit on
+///                                   parent-pid disappearance)
+///   `--`  ... app args ...
+///
+/// Behavior:
+///   1. Ignore SIGPIPE so writes to a closed parent stdout/stderr don't kill
+///      us in detached mode.
+///   2. Create stdout/stderr ptys, spawn `/usr/bin/open` with `--stdout`/
+///      `--stderr` set to the slave paths.
+///   3. Drain pty masters → forward each line to helper's own stdout/stderr.
+///      When the app exits, its pty slave closes → master gets EIO → drain
+///      thread ends.
+///   4. If `!--detached`, watch the parent PID via `parent-exit`; on parent
+///      death, exit (which closes the pty masters → app gets SIGHUP → orderly
+///      cascade kill).
+///   5. Block on the drain threads. When both finish (app exited), exit 0.
+pub(crate) fn run_helper_main() -> ! {
+    // 1. Become our own session leader (`setsid`) so the helper is detached
+    //    from the parent's session and process group. Without this, when the
+    //    session leader (typically the shell / test runner that spawned the
+    //    consumer process) dies, the kernel delivers SIGHUP to every process
+    //    in the session — helper included — which kills detached mode.
+    //
+    //    Also explicitly ignore SIGPIPE (writes to a closed parent stdio
+    //    pipe shouldn't kill us — we drain to void instead) and SIGHUP
+    //    (defense in depth in case a controlling terminal we don't know
+    //    about hangs up).
+    unsafe {
+        libc::setsid();
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+        libc::signal(libc::SIGHUP, libc::SIG_IGN);
+    }
+
+    // Parse args
+    let mut bundle: Option<std::path::PathBuf> = None;
+    let mut background = false;
+    let mut detached = false;
+    let mut app_args: Vec<String> = Vec::new();
+    let mut iter = std::env::args().skip(1);
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--bundle" => {
+                bundle = iter.next().map(std::path::PathBuf::from);
+            }
+            "--background" => background = true,
+            "--detached" => detached = true,
+            "--" => {
+                app_args.extend(iter.by_ref());
+                break;
+            }
+            other => {
+                eprintln!("launch-control: unknown arg: {other}");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    let bundle = match bundle {
+        Some(b) => b,
+        None => {
+            eprintln!("launch-control: --bundle <path> required");
+            std::process::exit(2);
+        }
+    };
+
+    let log_path = std::env::temp_dir().join(format!("launch-control-{}.log", std::process::id()));
+    fn log_to(path: &std::path::Path, msg: &str) {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            let _ = writeln!(f, "[{:.3}] [{}] {}", now, std::process::id(), msg);
+        }
+    }
+    log_to(&log_path, &format!(
+        "starting pid={} ppid={} detached={} background={} bundle={}",
+        std::process::id(),
+        unsafe { libc::getppid() },
+        detached,
+        background,
+        bundle.display(),
+    ));
+
+    // 2. Create ptys + spawn `open`
+    let (stdout_master, stdout_slave_path) = match create_pty() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("launch-control: create_pty(stdout) failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    let (stderr_master, stderr_slave_path) = match create_pty() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("launch-control: create_pty(stderr) failed: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let mut open_cmd = std::process::Command::new("/usr/bin/open");
+    open_cmd.arg("-n");
+    if background {
+        open_cmd.args(["-g", "-j"]);
+    }
+    open_cmd.arg("-a").arg(&bundle);
+    open_cmd.arg("--stdout").arg(&stdout_slave_path);
+    open_cmd.arg("--stderr").arg(&stderr_slave_path);
+    if !app_args.is_empty() {
+        open_cmd.arg("--args");
+        open_cmd.args(&app_args);
+    }
+    open_cmd.stdout(std::process::Stdio::null());
+    open_cmd.stderr(std::process::Stdio::piped());
+
+    let mut open_child = match open_cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("launch-control: failed to spawn /usr/bin/open: {e}");
+            std::process::exit(1);
+        }
+    };
+    let open_status = open_child.wait().ok();
+    if !open_status.map(|s| s.success()).unwrap_or(false) {
+        let mut open_stderr = String::new();
+        if let Some(mut stderr) = open_child.stderr.take() {
+            use std::io::Read;
+            let _ = stderr.read_to_string(&mut open_stderr);
+        }
+        eprintln!("launch-control: open failed: {open_stderr}");
+        std::process::exit(1);
+    }
+
+    log_to(&log_path, "open completed; about to find Studio PID via NSRunningApplication");
+
+    // Find the Studio PID (just for logging; not strictly needed by helper)
+    let bundle_id = bundle_id_from_path(&bundle).unwrap_or_default();
+    let studio_pid: Option<i32> = if !bundle_id.is_empty() {
+        let apps = NSRunningApplication::runningApplicationsWithBundleIdentifier(
+            &objc2_foundation::NSString::from_str(&bundle_id),
+        );
+        let mut newest: Option<(std::time::SystemTime, i32)> = None;
+        for app in apps.iter() {
+            let p = app.processIdentifier();
+            if p > 0 {
+                newest = match newest {
+                    None => Some((std::time::SystemTime::now(), p)),
+                    Some((t, _)) => Some((t, p)),
+                };
+            }
+        }
+        newest.map(|(_, p)| p)
+    } else {
+        None
+    };
+    log_to(&log_path, &format!("found studio_pid={studio_pid:?}; starting drain threads"));
+
+    // Watch Studio's exit so we log when it dies and can correlate timing
+    if let Some(pid) = studio_pid {
+        let lp = log_path.clone();
+        parent_exit::on_pid_exit(pid as u32, move || {
+            log_to(&lp, &format!("studio_pid={pid} EXITED"));
+        });
+    }
+
+    // 3. Drain pty masters → helper's stdout/stderr (real pipes to parent)
+    let stdout_handle = std::thread::spawn(move || {
+        relay_pty_to(stdout_master, std::io::stdout());
+    });
+    let stderr_handle = std::thread::spawn(move || {
+        relay_pty_to(stderr_master, std::io::stderr());
+    });
+
+    // 4. Watch parent PID. On Unix `getppid()` returns the immediate parent;
+    // for our use case (spawned by launch-control's `Command::spawn`), that's
+    // the consumer process (e.g. rodeo serve). If non-detached and parent
+    // dies, exit — that closes our pty masters, app gets SIGHUP, dies.
+    if !detached {
+        let parent_pid = unsafe { libc::getppid() } as u32;
+        log_to(&log_path, &format!("non-detached: registering parent_exit watch on pid={parent_pid}"));
+        if parent_pid > 1 {
+            let log_path_for_handler = log_path.clone();
+            parent_exit::on_pid_exit(parent_pid, move || {
+                log_to(&log_path_for_handler, "parent_exit handler fired; calling exit(0)");
+                std::process::exit(0);
+            });
+        }
+    } else {
+        log_to(&log_path, "detached: skipping parent_exit registration");
+    }
+
+    // 5. Block on drains. When both end (pty EOF — app exited), helper exits.
+    log_to(&log_path, "blocking on drain threads");
+    let _ = stdout_handle.join();
+    log_to(&log_path, "stdout drain finished");
+    let _ = stderr_handle.join();
+    log_to(&log_path, "stderr drain finished; exiting 0");
+    std::process::exit(0);
+}
+
+/// Drain a pty master into a writer (helper's stdout/stderr) line-buffered.
+/// If the writer fails (parent stdio closed), keep draining the pty into the
+/// void so the app doesn't fill its pty buffer and stall.
+fn relay_pty_to<W: std::io::Write>(reader: std::fs::File, mut writer: W) {
+    use std::io::{BufRead, BufReader, Read};
+    let log_path = std::env::temp_dir().join(format!("launch-control-{}.log", std::process::id()));
+    let log = |msg: &str| {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+            let _ = writeln!(f, "[{}] relay_pty: {msg}", std::process::id());
+        }
+    };
+    let mut buf_reader = BufReader::new(reader);
+    let mut line = String::new();
+    let mut sink = false;
+    let mut byte_buf = [0u8; 4096];
+    loop {
+        if sink {
+            // Parent closed; keep pty draining via raw reads.
+            line.clear();
+            match buf_reader.read(&mut byte_buf) {
+                Ok(0) => { log("EOF (sink mode)"); return; }
+                Err(e) => { log(&format!("read err in sink: {e}")); return; }
+                Ok(_) => continue,
+            }
+        }
+        line.clear();
+        match buf_reader.read_line(&mut line) {
+            Ok(0) => { log("EOF (line mode)"); return; }
+            Ok(_) => {
+                if writer.write_all(line.as_bytes()).is_err() {
+                    let _ = writer.flush();
+                    sink = true;
+                    log("write err → entering sink mode");
+                    continue;
+                }
+                let _ = writer.flush();
+            }
+            Err(e) => { log(&format!("read_line err: {e}")); return; }
+        }
+    }
 }
 
 /// Create a pty pair and return (master File, slave device path).
