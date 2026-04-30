@@ -94,6 +94,29 @@ fn synth_exit_status() -> ExitStatus {
     ExitStatus::from_raw(0)
 }
 
+/// If the `tokio` feature is on AND the registering thread has a current Tokio
+/// runtime, wrap the callback so it dispatches onto that runtime when the
+/// process exits. Otherwise return the callback unchanged.
+///
+/// Without this, callbacks fire from `parent-exit`'s OS-event thread (kqueue
+/// on macOS, waitpid on Linux, WaitForSingleObject on Windows), which has no
+/// Tokio context — `tokio::spawn(...)` inside the callback panics with
+/// "no reactor running".
+fn wrap_with_runtime_dispatch(
+    callback: impl FnOnce(ExitStatus) + Send + 'static,
+) -> Box<dyn FnOnce(ExitStatus) + Send> {
+    #[cfg(feature = "tokio")]
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        return Box::new(move |status| {
+            // `spawn(async move { ... })` puts the callback in async-task
+            // context: `tokio::spawn`, `Handle::current`, runtime-aware
+            // primitives (`Mutex::lock().await` etc.) all work inside.
+            handle.spawn(async move { callback(status) });
+        });
+    }
+    Box::new(callback)
+}
+
 /// Builder for launching an application. Mirrors `std::process::Command`.
 ///
 /// On macOS, the path should be an `.app` bundle (e.g. `/Applications/Safari.app`).
@@ -263,14 +286,23 @@ impl Child {
     /// If the process has already exited, the callback fires immediately on the
     /// calling thread. Otherwise it fires on a dedicated watcher thread.
     ///
+    /// **With the `tokio` feature enabled**, registration captures the calling
+    /// thread's current Tokio runtime handle (if any) and dispatches the
+    /// callback through it — making `tokio::spawn(...)` and other runtime-
+    /// dependent calls inside the callback work correctly. Without the feature
+    /// (or without a current runtime at registration), the callback runs on
+    /// the OS-event watcher thread, which has no Tokio context — calling
+    /// `tokio::spawn(...)` in that case panics with "no reactor running".
+    ///
     /// Callback receives the process's `ExitStatus`. On macOS, apps launched via
     /// NSWorkspace are not direct children, so we cannot read a real exit code;
     /// the status will be a synthesized successful exit. On Windows, the real
     /// `GetExitCodeProcess` value is reported.
     pub fn on_exit(&self, callback: impl FnOnce(ExitStatus) + Send + 'static) {
+        let callback = wrap_with_runtime_dispatch(callback);
         let mut state = self.exit_state.lock().unwrap();
         match &mut *state {
-            ExitState::Pending(cbs) => cbs.push(Box::new(callback)),
+            ExitState::Pending(cbs) => cbs.push(callback),
             ExitState::Exited(status) => {
                 let status = *status;
                 drop(state);

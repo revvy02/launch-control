@@ -9,7 +9,20 @@ repository = "https://github.com/revvy02/launch-control"
 [dependencies]
 keyboard-types = "0.7"
 parent-exit = { path = "../../parent-exit" }
+tokio = { version = "1", default-features = false, features = ["rt"], optional = true }
 tracing = "0.1"
+
+[features]
+default = []
+# When enabled, `Child::on_exit` captures the calling thread's Tokio runtime
+# handle at registration time and dispatches the callback through it.
+# Eliminates the foot-gun of `tokio::spawn(...)` panicking inside an
+# `on_exit` callback — that callback fires from `parent-exit`'s OS-event
+# thread (kqueue / waitpid / WaitForSingleObject), which has no Tokio
+# runtime context. Without this feature, the callback runs on the OS-event
+# thread; with it, the callback is dispatched onto the Tokio runtime that
+# was current at registration.
+tokio = ["dep:tokio"]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
