@@ -11,7 +11,6 @@ use objc2_foundation::{NSArray, NSString, NSURL};
 use std::io;
 use std::process::ExitStatus;
 use std::sync::{mpsc, Mutex};
-use std::time::{Duration, Instant};
 
 /// Serializes the snapshot → open → PID-claim window in `spawn_piped`.
 /// The lookup uses NSRunningApplication's bundle-ID set diff, which is
