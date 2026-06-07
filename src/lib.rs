@@ -368,9 +368,7 @@ impl Child {
         }
         #[cfg(target_os = "windows")]
         {
-            // TODO: Use SendMessage/PostMessage for PID-targeted keystroke on Windows
-            let _ = (code, modifiers);
-            return Err(Error::Unsupported);
+            return self.inner.send_keystroke(code, modifiers);
         }
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {

@@ -15,13 +15,16 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateProcessW, GetExitCodeProcess, OpenProcess, TerminateProcess, WaitForSingleObject,
-    PROCESS_INFORMATION, STARTF_USESHOWWINDOW, STARTUPINFOW,
+    AttachThreadInput, CreateProcessW, GetCurrentThreadId, GetExitCodeProcess, OpenProcess,
+    TerminateProcess, WaitForSingleObject, PROCESS_INFORMATION, STARTF_USESHOWWINDOW, STARTUPINFOW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow, ShowWindow,
+    BringWindowToTop, EnumWindows, GetForegroundWindow, GetWindow, GetWindowTextLengthW,
+    GetWindowThreadProcessId, IsWindowVisible, SetForegroundWindow, ShowWindow, GW_OWNER,
     SW_SHOWMINNOACTIVE, SW_SHOWNORMAL,
 };
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{keybd_event, KEYEVENTF_KEYUP};
+use keyboard_types::{Code, Modifiers};
 
 // Process access rights (literals to avoid feature-gated constant imports).
 const PROCESS_TERMINATE: u32 = 0x0001;
@@ -47,7 +50,7 @@ unsafe impl Sync for WindowsHandle {}
 
 impl WindowsHandle {
     pub fn focus(&self) -> Result<()> {
-        let hwnd = find_window_by_pid(self.pid)
+        let hwnd = find_main_window_by_pid(self.pid)
             .ok_or_else(|| Error::Platform("no window found for process".into()))?;
 
         // Re-request foreground every tick. SetForegroundWindow can silently
@@ -61,20 +64,7 @@ impl WindowsHandle {
         let started = Instant::now();
         let mut ticks = 0u32;
         loop {
-            unsafe {
-                ShowWindow(hwnd, SW_SHOWNORMAL);
-                SetForegroundWindow(hwnd);
-            }
-            let front_pid: u32 = unsafe {
-                let front_hwnd = GetForegroundWindow();
-                if !front_hwnd.is_null() {
-                    let mut pid: u32 = 0;
-                    GetWindowThreadProcessId(front_hwnd, &mut pid);
-                    pid
-                } else {
-                    0
-                }
-            };
+            let front_pid = force_foreground(hwnd);
             if front_pid == self.pid {
                 tracing::debug!(
                     pid = self.pid,
@@ -108,6 +98,64 @@ impl WindowsHandle {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
+    }
+
+    /// Send a keystroke to the process.
+    ///
+    /// Windows has no per-process key injection like macOS's `CGEventPostToPid`,
+    /// so `keybd_event` injects into the foreground input queue. The target must
+    /// therefore be foreground: bring it forward and bail (rather than type into
+    /// whatever app *is* foreground) if it won't take focus. Callers that already
+    /// `focus()` make the foreground step here a cheap no-op.
+    pub fn send_keystroke(&self, code: Code, modifiers: Modifiers) -> Result<()> {
+        let vk = code_to_vk(code).ok_or(Error::Unsupported)?;
+        let hwnd = find_main_window_by_pid(self.pid)
+            .ok_or_else(|| Error::Platform("no window found for process".into()))?;
+
+        // Remember the prior foreground so we can hand focus back afterward —
+        // macOS's CGEventPostToPid never disturbs the foreground at all, and
+        // restoring it here keeps this Windows path as close to that contract as
+        // the (foreground-only) SendInput mechanism allows.
+        let prev_foreground = unsafe { GetForegroundWindow() };
+
+        let front_pid = force_foreground(hwnd);
+        if front_pid != self.pid {
+            return Err(Error::Platform(format!(
+                "send_keystroke: target pid {} not foreground (was {front_pid})",
+                self.pid
+            )));
+        }
+        // Let the just-foregrounded window become input-ready before typing.
+        std::thread::sleep(Duration::from_millis(120));
+
+        // Chord: modifiers down → key down → key up → modifiers up (reverse).
+        // Space the events out — Studio's Qt event loop must observe the
+        // modifier as held when the key arrives; a microsecond burst can drop
+        // the modifier so the key registers bare (Ctrl+S → a plain "s", no save).
+        let mods = modifier_vks(modifiers);
+        let gap = Duration::from_millis(40);
+        unsafe {
+            for &m in &mods {
+                keybd_event(m, 0, 0, 0);
+                std::thread::sleep(gap);
+            }
+            keybd_event(vk, 0, 0, 0);
+            std::thread::sleep(gap);
+            keybd_event(vk, 0, KEYEVENTF_KEYUP, 0);
+            std::thread::sleep(gap);
+            for &m in mods.iter().rev() {
+                keybd_event(m, 0, KEYEVENTF_KEYUP, 0);
+                std::thread::sleep(gap);
+            }
+        }
+
+        // The chord is now queued to the target's input thread (it'll be drained
+        // by Studio's event loop regardless of focus), so hand focus back to
+        // whatever was foreground before — best-effort, keeps the steal invisible.
+        if !prev_foreground.is_null() && prev_foreground != hwnd {
+            force_foreground(prev_foreground);
+        }
+        Ok(())
     }
 
     /// Kill returning io::Error (for Child::kill compatibility).
@@ -411,4 +459,117 @@ fn find_window_by_pid(target_pid: u32) -> Option<HWND> {
     }
 
     data.found_hwnd
+}
+
+/// Find the process's MAIN top-level window: visible, unowned, and titled.
+///
+/// `find_window_by_pid` returns the *first* enumerated window, which for Studio
+/// (Qt) is a hidden, owned helper (`Qt5159QWindowIcon`, 66x39) — focusing or
+/// typing into it does nothing. The editor document window is the visible,
+/// unowned, titled one (it carries the place path as its title). Used for
+/// focus/keystroke; adoption keeps using the looser any-window check.
+fn find_main_window_by_pid(target_pid: u32) -> Option<HWND> {
+    struct FindData {
+        target_pid: u32,
+        found_hwnd: Option<HWND>,
+    }
+
+    unsafe extern "system" fn enum_callback(hwnd: HWND, lparam: isize) -> BOOL {
+        let data = &mut *(lparam as *mut FindData);
+        let mut window_pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, &mut window_pid);
+        if window_pid == data.target_pid
+            && IsWindowVisible(hwnd) != 0
+            && GetWindow(hwnd, GW_OWNER).is_null()
+            && GetWindowTextLengthW(hwnd) > 0
+        {
+            data.found_hwnd = Some(hwnd);
+            return 0; // stop enumeration
+        }
+        1 // continue
+    }
+
+    let mut data = FindData {
+        target_pid,
+        found_hwnd: None,
+    };
+
+    unsafe {
+        EnumWindows(Some(enum_callback), &mut data as *mut _ as isize);
+    }
+
+    data.found_hwnd
+}
+
+/// Best-effort bring `hwnd` to the foreground and return the pid that owns the
+/// foreground afterward. Briefly attaches our input thread to the current
+/// foreground thread — the standard trick to bypass Windows' focus-stealing
+/// prevention, so `SetForegroundWindow` actually takes effect from a background
+/// (console) process competing with another GUI app for the foreground.
+fn force_foreground(hwnd: HWND) -> u32 {
+    unsafe {
+        let fg = GetForegroundWindow();
+        let mut fg_pid = 0u32;
+        let fg_thread = if fg.is_null() {
+            0
+        } else {
+            GetWindowThreadProcessId(fg, &mut fg_pid)
+        };
+        let our_thread = GetCurrentThreadId();
+        let attach = fg_thread != 0 && fg_thread != our_thread;
+        if attach {
+            AttachThreadInput(our_thread, fg_thread, 1);
+        }
+        ShowWindow(hwnd, SW_SHOWNORMAL);
+        BringWindowToTop(hwnd);
+        SetForegroundWindow(hwnd);
+        if attach {
+            AttachThreadInput(our_thread, fg_thread, 0);
+        }
+        let front = GetForegroundWindow();
+        let mut pid = 0u32;
+        if !front.is_null() {
+            GetWindowThreadProcessId(front, &mut pid);
+        }
+        pid
+    }
+}
+
+/// Map a `keyboard_types::Code` to a Windows virtual-key code (`bVk` for
+/// `keybd_event`). Letters and digits map to their ASCII values (VK_A..VK_Z =
+/// 0x41..0x5A, VK_0..VK_9 = 0x30..0x39). Returns None for unmapped keys.
+fn code_to_vk(code: Code) -> Option<u8> {
+    use keyboard_types::Code::*;
+    Some(match code {
+        KeyA => 0x41, KeyB => 0x42, KeyC => 0x43, KeyD => 0x44, KeyE => 0x45,
+        KeyF => 0x46, KeyG => 0x47, KeyH => 0x48, KeyI => 0x49, KeyJ => 0x4A,
+        KeyK => 0x4B, KeyL => 0x4C, KeyM => 0x4D, KeyN => 0x4E, KeyO => 0x4F,
+        KeyP => 0x50, KeyQ => 0x51, KeyR => 0x52, KeyS => 0x53, KeyT => 0x54,
+        KeyU => 0x55, KeyV => 0x56, KeyW => 0x57, KeyX => 0x58, KeyY => 0x59,
+        KeyZ => 0x5A,
+        Digit0 => 0x30, Digit1 => 0x31, Digit2 => 0x32, Digit3 => 0x33,
+        Digit4 => 0x34, Digit5 => 0x35, Digit6 => 0x36, Digit7 => 0x37,
+        Digit8 => 0x38, Digit9 => 0x39,
+        Enter => 0x0D, Tab => 0x09, Space => 0x20, Escape => 0x1B,
+        Backspace => 0x08, Delete => 0x2E,
+        _ => return None,
+    })
+}
+
+/// Virtual-key codes for the held modifiers, in press order.
+fn modifier_vks(modifiers: Modifiers) -> Vec<u8> {
+    let mut v = Vec::new();
+    if modifiers.contains(Modifiers::CONTROL) {
+        v.push(0x11); // VK_CONTROL
+    }
+    if modifiers.contains(Modifiers::SHIFT) {
+        v.push(0x10); // VK_SHIFT
+    }
+    if modifiers.contains(Modifiers::ALT) {
+        v.push(0x12); // VK_MENU
+    }
+    if modifiers.contains(Modifiers::META) {
+        v.push(0x5B); // VK_LWIN
+    }
+    v
 }
