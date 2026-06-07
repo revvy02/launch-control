@@ -395,6 +395,12 @@ impl ChildStdout {
     pub fn recv_timeout(&self, timeout: std::time::Duration) -> std::result::Result<String, mpsc::RecvTimeoutError> {
         self.rx.recv_timeout(timeout)
     }
+
+    /// Non-blocking line receive. `Err(Empty)` if no line is queued yet,
+    /// `Err(Disconnected)` once the drain thread has exited (EOF).
+    pub fn try_recv(&self) -> std::result::Result<String, mpsc::TryRecvError> {
+        self.rx.try_recv()
+    }
 }
 
 impl Read for ChildStdout {
@@ -445,6 +451,18 @@ pub struct ChildStderr {
     rx: mpsc::Receiver<String>,
     buf: Vec<u8>,
     pos: usize,
+}
+
+impl ChildStderr {
+    pub fn recv_timeout(&self, timeout: std::time::Duration) -> std::result::Result<String, mpsc::RecvTimeoutError> {
+        self.rx.recv_timeout(timeout)
+    }
+
+    /// Non-blocking line receive. `Err(Empty)` if no line is queued yet,
+    /// `Err(Disconnected)` once the drain thread has exited (EOF).
+    pub fn try_recv(&self) -> std::result::Result<String, mpsc::TryRecvError> {
+        self.rx.try_recv()
+    }
 }
 
 impl Read for ChildStderr {

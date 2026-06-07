@@ -8,15 +8,21 @@ use std::process::ExitStatus;
 use std::ptr;
 use std::time::{Duration, Instant};
 
+use std::os::windows::io::FromRawHandle;
+
 use windows_sys::Win32::Foundation::{
-    CloseHandle, BOOL, HANDLE, HWND, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, SetHandleInformation, BOOL, HANDLE, HANDLE_FLAG_INHERIT, HWND,
+    INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
+use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 use windows_sys::Win32::System::Threading::{
     AttachThreadInput, CreateProcessW, GetCurrentThreadId, GetExitCodeProcess, OpenProcess,
-    TerminateProcess, WaitForSingleObject, PROCESS_INFORMATION, STARTF_USESHOWWINDOW, STARTUPINFOW,
+    TerminateProcess, WaitForSingleObject, PROCESS_INFORMATION, STARTF_USESHOWWINDOW,
+    STARTF_USESTDHANDLES, STARTUPINFOW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, EnumWindows, GetForegroundWindow, GetWindow, GetWindowTextLengthW,
@@ -242,6 +248,32 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<crate::Child> {
         SW_SHOWNORMAL as u16
     };
 
+    // Wire up stdout/stderr capture when requested — parity with the macOS
+    // pty-backed stdio. The child inherits the (inheritable) pipe write ends via
+    // STARTF_USESTDHANDLES + bInheritHandles; we keep + drain the read ends.
+    let want_capture = cmd.stdout_cfg.is_some() || cmd.stderr_cfg.is_some();
+    let mut stdout_read: Option<HANDLE> = None;
+    let mut stderr_read: Option<HANDLE> = None;
+    let mut write_ends: Vec<HANDLE> = Vec::new();
+    if want_capture {
+        si.dwFlags |= STARTF_USESTDHANDLES;
+        si.hStdInput = ptr::null_mut();
+        if cmd.stdout_cfg.is_some() {
+            if let Some((r, w)) = unsafe { create_inheritable_pipe() } {
+                si.hStdOutput = w;
+                stdout_read = Some(r);
+                write_ends.push(w);
+            }
+        }
+        if cmd.stderr_cfg.is_some() {
+            if let Some((r, w)) = unsafe { create_inheritable_pipe() } {
+                si.hStdError = w;
+                stderr_read = Some(r);
+                write_ends.push(w);
+            }
+        }
+    }
+
     let mut pi: PROCESS_INFORMATION = unsafe { mem::zeroed() };
 
     // `Command::detached(true)` → DETACHED_PROCESS + CREATE_NEW_PROCESS_GROUP.
@@ -263,7 +295,9 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<crate::Child> {
             wide_cmd.as_mut_ptr(),
             ptr::null(),
             ptr::null(),
-            0, // bInheritHandles = FALSE
+            // bInheritHandles: TRUE when capturing so the child inherits the
+            // pipe write ends (only those are marked inheritable).
+            if want_capture { 1 } else { 0 },
             creation_flags,
             ptr::null(),
             ptr::null(),
@@ -273,12 +307,29 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<crate::Child> {
     };
 
     if ok == 0 {
+        unsafe {
+            for w in &write_ends {
+                CloseHandle(*w);
+            }
+            if let Some(r) = stdout_read {
+                CloseHandle(r);
+            }
+            if let Some(r) = stderr_read {
+                CloseHandle(r);
+            }
+        }
         return Err(Error::Platform("CreateProcessW failed".into()));
     }
 
     // Close thread handle immediately (only need the process handle)
     unsafe {
         CloseHandle(pi.hThread);
+    }
+
+    // Close our copies of the pipe write ends — the child holds its own. Keeping
+    // them open would prevent the read ends from ever seeing EOF.
+    for w in &write_ends {
+        unsafe { CloseHandle(*w) };
     }
 
     // The launched process may be a bootstrapper that relaunches the real GUI
@@ -290,23 +341,53 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<crate::Child> {
     let (pid, process_handle) =
         adopt_real_process(&exe_name, &pre_pids, pi.dwProcessId, pi.hProcess);
 
-    // NOTE: stdout/stderr are not piped on Windows. When a bootstrapper hands
-    // off, the real editor is a detached descendant whose stdio isn't connected
-    // to our pipe, so capture isn't meaningful here; consumers that gate on
-    // process output (e.g. a login marker) must fall back to log-file scanning.
+    // Drain each captured pipe through the shared line-channel helpers (the same
+    // plumbing macOS uses for its pty masters), exposing ChildStdout/ChildStderr.
+    // The bootstrapper inherits the pipe write ends and passes them to the
+    // relaunched editor, so the real editor's stdout/stderr flow here too.
+    let stdout = stdout_read.map(|r| {
+        let file = unsafe { std::fs::File::from_raw_handle(r as _) };
+        let (tx, rx) = std::sync::mpsc::channel();
+        crate::start_drain_thread(file, tx);
+        crate::make_child_stdout(rx)
+    });
+    let stderr = stderr_read.map(|r| {
+        let file = unsafe { std::fs::File::from_raw_handle(r as _) };
+        let (tx, rx) = std::sync::mpsc::channel();
+        crate::start_drain_thread(file, tx);
+        crate::make_child_stderr(rx)
+    });
+
     let exit_state = std::sync::Arc::new(std::sync::Mutex::new(crate::ExitState::default()));
     crate::start_exit_watcher(pid, exit_state.clone());
 
     Ok(crate::Child {
         pid,
-        stdout: None,
-        stderr: None,
+        stdout,
+        stderr,
         exit_state,
         inner: WindowsHandle {
             process_handle,
             pid,
         },
     })
+}
+
+/// Create an anonymous pipe whose WRITE end is inheritable (handed to the child
+/// via STARTF_USESTDHANDLES) and whose READ end stays private to us. Returns
+/// `(read, write)`.
+unsafe fn create_inheritable_pipe() -> Option<(HANDLE, HANDLE)> {
+    let mut sa: SECURITY_ATTRIBUTES = mem::zeroed();
+    sa.nLength = mem::size_of::<SECURITY_ATTRIBUTES>() as u32;
+    sa.bInheritHandle = 1; // both ends inheritable as created...
+    let mut read: HANDLE = ptr::null_mut();
+    let mut write: HANDLE = ptr::null_mut();
+    if CreatePipe(&mut read, &mut write, &sa, 0) == 0 {
+        return None;
+    }
+    // ...then clear inheritance on the read end so the child doesn't get it.
+    SetHandleInformation(read, HANDLE_FLAG_INHERIT, 0);
+    Some((read, write))
 }
 
 /// Enumerate PIDs of all running processes whose image name matches `exe_name`
