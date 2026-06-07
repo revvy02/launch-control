@@ -1,21 +1,39 @@
 use crate::error::{Error, Result};
 use crate::Command;
 
+use std::collections::HashSet;
 use std::io;
 use std::mem;
 use std::process::ExitStatus;
 use std::ptr;
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{CloseHandle, BOOL, HANDLE, HWND, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, BOOL, HANDLE, HWND, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+};
 use windows_sys::Win32::System::Threading::{
-    CreateProcessW, GetExitCodeProcess, TerminateProcess, WaitForSingleObject,
-    PROCESS_INFORMATION, STARTF_USESHOWWINDOW, STARTUPINFOW, INFINITE,
+    CreateProcessW, GetExitCodeProcess, OpenProcess, TerminateProcess, WaitForSingleObject,
+    PROCESS_INFORMATION, STARTF_USESHOWWINDOW, STARTUPINFOW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetForegroundWindow, GetWindowThreadProcessId, SW_SHOWNORMAL, SW_SHOWMINNOACTIVE,
-    SetForegroundWindow, ShowWindow,
+    EnumWindows, GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow, ShowWindow,
+    SW_SHOWMINNOACTIVE, SW_SHOWNORMAL,
 };
+
+// Process access rights (literals to avoid feature-gated constant imports).
+const PROCESS_TERMINATE: u32 = 0x0001;
+const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+const SYNCHRONIZE: u32 = 0x0010_0000;
+
+/// How long to wait for the real GUI process to appear after a bootstrapper
+/// handoff before giving up and tracking the originally-launched process.
+const ADOPT_DEADLINE: Duration = Duration::from_secs(30);
+/// Grace period before concluding "no handoff happened, the launched process
+/// IS the app" — only applies when no same-exe sibling has appeared.
+const ADOPT_GRACE: Duration = Duration::from_secs(3);
 
 /// Windows-specific handle wrapping a process HANDLE.
 pub(crate) struct WindowsHandle {
@@ -141,6 +159,15 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<crate::Child> {
         return Err(Error::NotFound(exe_path.display().to_string()));
     }
 
+    // Snapshot existing same-exe PIDs *before* launch so adopt_real_process can
+    // distinguish a freshly-spawned editor (after a bootstrapper handoff) from
+    // pre-existing instances of the same executable.
+    let exe_name = exe_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let pre_pids = pids_for_exe(&exe_name);
+
     // Build command line: "exe_path" arg1 arg2 ...
     let mut cmd_line = format!("\"{}\"", exe_path.display());
     for arg in &cmd.args {
@@ -206,8 +233,19 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<crate::Child> {
         CloseHandle(pi.hThread);
     }
 
-    let pid = pi.dwProcessId;
+    // The launched process may be a bootstrapper that relaunches the real GUI
+    // app as a separate process and then exits — Roblox Studio's
+    // RobloxStudioBeta.exe does exactly this. Adopt the real, surviving editor
+    // so try_wait/kill/on_exit track it rather than the bootstrapper (whose
+    // exit would otherwise look like a launch failure while the app is up).
+    // Apps that don't hand off are returned unchanged.
+    let (pid, process_handle) =
+        adopt_real_process(&exe_name, &pre_pids, pi.dwProcessId, pi.hProcess);
 
+    // NOTE: stdout/stderr are not piped on Windows. When a bootstrapper hands
+    // off, the real editor is a detached descendant whose stdio isn't connected
+    // to our pipe, so capture isn't meaningful here; consumers that gate on
+    // process output (e.g. a login marker) must fall back to log-file scanning.
     let exit_state = std::sync::Arc::new(std::sync::Mutex::new(crate::ExitState::default()));
     crate::start_exit_watcher(pid, exit_state.clone());
 
@@ -217,10 +255,131 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<crate::Child> {
         stderr: None,
         exit_state,
         inner: WindowsHandle {
-            process_handle: pi.hProcess,
+            process_handle,
             pid,
         },
     })
+}
+
+/// Enumerate PIDs of all running processes whose image name matches `exe_name`
+/// (case-insensitive, e.g. "RobloxStudioBeta.exe").
+fn pids_for_exe(exe_name: &str) -> HashSet<u32> {
+    let mut set = HashSet::new();
+    if exe_name.is_empty() {
+        return set;
+    }
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return set;
+        }
+        let mut entry: PROCESSENTRY32W = mem::zeroed();
+        entry.dwSize = mem::size_of::<PROCESSENTRY32W>() as u32;
+        if Process32FirstW(snap, &mut entry) != 0 {
+            loop {
+                let name = wide_to_string(&entry.szExeFile);
+                if name.eq_ignore_ascii_case(exe_name) {
+                    set.insert(entry.th32ProcessID);
+                }
+                if Process32NextW(snap, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snap);
+    }
+    set
+}
+
+/// Decode a null-terminated UTF-16 buffer (e.g. PROCESSENTRY32W.szExeFile).
+fn wide_to_string(buf: &[u16]) -> String {
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    String::from_utf16_lossy(&buf[..len])
+}
+
+/// True if the process behind `handle` is still running.
+fn process_alive(handle: HANDLE) -> bool {
+    unsafe { WaitForSingleObject(handle, 0) == WAIT_TIMEOUT }
+}
+
+/// Open a process handle suitable for try_wait (SYNCHRONIZE + query) and kill
+/// (terminate). Returns None if the process can't be opened.
+fn open_tracked_handle(pid: u32) -> Option<HANDLE> {
+    let h = unsafe {
+        OpenProcess(
+            SYNCHRONIZE | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+            0,
+            pid,
+        )
+    };
+    if h.is_null() {
+        None
+    } else {
+        Some(h)
+    }
+}
+
+/// Resolve the real GUI process to track after a possible bootstrapper handoff.
+///
+/// Strategy: poll for a same-exe process that is new since launch (not in
+/// `pre`, and not the bootstrapper `launched_pid`) and owns a top-level window
+/// — that's the relaunched editor. Adopt it. If no sibling ever appears within
+/// the grace window, the launched process didn't hand off and IS the app, so
+/// track it unchanged. Falls back to the launched process on timeout.
+fn adopt_real_process(
+    exe_name: &str,
+    pre: &HashSet<u32>,
+    launched_pid: u32,
+    launched_handle: HANDLE,
+) -> (u32, HANDLE) {
+    let start = Instant::now();
+    let deadline = start + ADOPT_DEADLINE;
+    loop {
+        let current = pids_for_exe(exe_name);
+        let siblings: Vec<u32> = current
+            .iter()
+            .copied()
+            .filter(|p| !pre.contains(p) && *p != launched_pid)
+            .collect();
+
+        // A windowed sibling is the relaunched editor — adopt it.
+        if let Some(&editor) = siblings.iter().find(|&&p| find_window_by_pid(p).is_some()) {
+            if let Some(h) = open_tracked_handle(editor) {
+                tracing::info!(
+                    bootstrapper_pid = launched_pid,
+                    editor_pid = editor,
+                    elapsed_ms = start.elapsed().as_millis() as u64,
+                    "adopted real editor process after bootstrapper handoff",
+                );
+                unsafe { CloseHandle(launched_handle) };
+                return (editor, h);
+            }
+        }
+
+        let launched_alive = process_alive(launched_handle);
+
+        // No handoff: launched process is still alive, no same-exe sibling has
+        // appeared, and the grace window has elapsed → it IS the app.
+        if launched_alive && siblings.is_empty() && start.elapsed() >= ADOPT_GRACE {
+            return (launched_pid, launched_handle);
+        }
+
+        // Launched process died with no sibling to adopt → genuine early exit.
+        // Hand back the (dead) launched handle so the caller observes the exit.
+        if !launched_alive && siblings.is_empty() {
+            return (launched_pid, launched_handle);
+        }
+
+        if Instant::now() >= deadline {
+            tracing::warn!(
+                launched_pid,
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                "adopt_real_process timed out; tracking originally-launched process",
+            );
+            return (launched_pid, launched_handle);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 
