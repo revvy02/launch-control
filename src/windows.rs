@@ -6,6 +6,7 @@ use std::io;
 use std::mem;
 use std::process::ExitStatus;
 use std::ptr;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use std::os::windows::io::FromRawHandle;
@@ -24,6 +25,11 @@ use windows_sys::Win32::System::Threading::{
     TerminateProcess, WaitForSingleObject, PROCESS_INFORMATION, STARTF_USESHOWWINDOW,
     STARTF_USESTDHANDLES, STARTUPINFOW,
 };
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
+    JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, EnumWindows, GetForegroundWindow, GetWindow, GetWindowTextLengthW,
     GetWindowThreadProcessId, IsWindowVisible, SetForegroundWindow, ShowWindow, GW_OWNER,
@@ -34,6 +40,7 @@ use keyboard_types::{Code, Modifiers};
 
 // Process access rights (literals to avoid feature-gated constant imports).
 const PROCESS_TERMINATE: u32 = 0x0001;
+const PROCESS_SET_QUOTA: u32 = 0x0100;
 const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 const SYNCHRONIZE: u32 = 0x0010_0000;
 
@@ -341,6 +348,13 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<crate::Child> {
     let (pid, process_handle) =
         adopt_real_process(&exe_name, &pre_pids, pi.dwProcessId, pi.hProcess);
 
+    // Bind non-detached apps to our lifetime job so the OS tears them down when
+    // this process exits — even on an uncatchable TerminateProcess, where no
+    // Drop/handler runs. `detached` apps are meant to outlive us, so skip them.
+    if !cmd.detached {
+        bind_to_lifetime_job(process_handle);
+    }
+
     // Drain each captured pipe through the shared line-channel helpers (the same
     // plumbing macOS uses for its pty masters), exposing ChildStdout/ChildStderr.
     // The bootstrapper inherits the pipe write ends and passes them to the
@@ -436,7 +450,9 @@ fn process_alive(handle: HANDLE) -> bool {
 fn open_tracked_handle(pid: u32) -> Option<HANDLE> {
     let h = unsafe {
         OpenProcess(
-            SYNCHRONIZE | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+            // PROCESS_SET_QUOTA is required (alongside PROCESS_TERMINATE) for
+            // AssignProcessToJobObject — see `bind_to_lifetime_job`.
+            SYNCHRONIZE | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SET_QUOTA,
             0,
             pid,
         )
@@ -445,6 +461,57 @@ fn open_tracked_handle(pid: u32) -> Option<HANDLE> {
         None
     } else {
         Some(h)
+    }
+}
+
+/// Process-global job object that non-detached launched apps are bound to.
+///
+/// Configured `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`: when **this** process exits
+/// — gracefully or via an uncatchable `TerminateProcess` — the OS closes the
+/// job handle and tears down every app we launched. This is the Windows
+/// analogue of the Unix process-group cleanup callers rely on (a parent dies →
+/// its launched apps die). Stored as `usize` because a raw `HANDLE` isn't
+/// `Send`/`Sync`; `0` means "job creation failed, no-op".
+static LIFETIME_JOB: OnceLock<usize> = OnceLock::new();
+
+fn lifetime_job() -> HANDLE {
+    let raw = *LIFETIME_JOB.get_or_init(|| unsafe {
+        let job = CreateJobObjectW(ptr::null(), ptr::null());
+        if job.is_null() {
+            return 0;
+        }
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const _,
+            mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        );
+        job as usize
+    });
+    raw as HANDLE
+}
+
+/// Bind a process to the lifetime job so it dies when this process does.
+///
+/// Studio's bootstrapper relaunches the real editor as a process that breaks
+/// away from any *inherited* job, so the editor escapes the job our own parent
+/// put us in. An *explicit* `AssignProcessToJobObject` after adoption is not
+/// defeated by breakaway and nests under any pre-existing job on Windows 8+.
+/// Best-effort: assignment can still fail (e.g. a job in the hierarchy that
+/// disallows nesting) — log and continue rather than fail the launch.
+fn bind_to_lifetime_job(process_handle: HANDLE) {
+    let job = lifetime_job();
+    if job.is_null() {
+        return;
+    }
+    let ok = unsafe { AssignProcessToJobObject(job, process_handle) };
+    if ok == 0 {
+        tracing::debug!(
+            error = ?io::Error::last_os_error(),
+            "AssignProcessToJobObject failed; launched app won't be auto-killed when this process exits",
+        );
     }
 }
 
