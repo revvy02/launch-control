@@ -44,6 +44,13 @@ const PROCESS_SET_QUOTA: u32 = 0x0100;
 const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 const SYNCHRONIZE: u32 = 0x0010_0000;
 
+/// Serializes keystroke injection process-wide. `keybd_event` writes to the
+/// single global input queue and requires the target window foregrounded, so
+/// two threads injecting concurrently (e.g. saving several Studios at once)
+/// steal focus from each other and interleave their chords — dropping the
+/// keystroke entirely. See `WindowsHandle::send_keystroke`.
+static KEYSTROKE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// How long to wait for the real GUI process to appear after a bootstrapper
 /// handoff before giving up and tracking the originally-launched process.
 const ADOPT_DEADLINE: Duration = Duration::from_secs(30);
@@ -124,6 +131,12 @@ impl WindowsHandle {
         let vk = code_to_vk(code).ok_or(Error::Unsupported)?;
         let hwnd = find_main_window_by_pid(self.pid)
             .ok_or_else(|| Error::Platform("no window found for process".into()))?;
+
+        // Hold the global keystroke lock across the whole focus→inject→restore
+        // so concurrent injections (e.g. saving multiple Studios at once) don't
+        // steal focus from each other and interleave chords. Recover from
+        // poisoning — a panicked prior injection shouldn't wedge all saves.
+        let _inject_guard = KEYSTROKE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         // Remember the prior foreground so we can hand focus back afterward —
         // macOS's CGEventPostToPid never disturbs the foreground at all, and
