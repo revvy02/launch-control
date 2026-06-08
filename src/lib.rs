@@ -137,6 +137,14 @@ pub struct Command {
     /// SIGKILL of the parent doesn't take the app with it. See
     /// [`Command::detached`] for the platform-specific implementation notes.
     pub(crate) detached: bool,
+    /// Windows-only, detached-only: open the launch through the shell (explorer)
+    /// rather than spawning the exe directly. The app is then rooted at the
+    /// persistent shell instead of the caller — the Windows analogue of macOS's
+    /// NSWorkspace→launchd reparenting. For Roblox Studio this also avoids the
+    /// bootstrapper handoff, so it stays a single process we can adopt. Opens
+    /// `args[0]` (e.g. a place file) via `explorer.exe`; the app to adopt is
+    /// still identified by `path`'s exe name. No-op when not detached / non-Windows.
+    pub(crate) shell_open: bool,
 }
 
 impl Command {
@@ -150,6 +158,7 @@ impl Command {
             stdout_cfg: None,
             stderr_cfg: None,
             detached: false,
+            shell_open: false,
         }
     }
 
@@ -208,6 +217,14 @@ impl Command {
     /// detached only governs implicit propagation when the parent dies.
     pub fn detached(&mut self, detached: bool) -> &mut Self {
         self.detached = detached;
+        self
+    }
+
+    /// Open a detached launch through the shell (explorer) instead of spawning
+    /// the exe directly. See the [`shell_open`](Command::shell_open) field. Only
+    /// affects detached launches on Windows; a no-op otherwise.
+    pub fn shell_open(&mut self, shell_open: bool) -> &mut Self {
+        self.shell_open = shell_open;
         self
     }
 

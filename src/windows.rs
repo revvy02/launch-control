@@ -144,7 +144,20 @@ impl WindowsHandle {
         // the (foreground-only) SendInput mechanism allows.
         let prev_foreground = unsafe { GetForegroundWindow() };
 
-        let front_pid = force_foreground(hwnd);
+        // Bring the target to the foreground, retrying briefly —
+        // SetForegroundWindow can need several attempts on a cold/contended
+        // desktop. This retry MUST live here, under KEYSTROKE_LOCK, so that
+        // concurrent saves (several Studios at once) can't steal each other's
+        // foreground mid-chord. Callers must therefore NOT pre-focus outside
+        // the lock: a focus() race outside the lock reintroduces exactly the
+        // foreground-steal that drops Ctrl+S. Foreground is a single
+        // system-wide resource, so saves are necessarily serialized here.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut front_pid = force_foreground(hwnd);
+        while front_pid != self.pid && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+            front_pid = force_foreground(hwnd);
+        }
         if front_pid != self.pid {
             return Err(Error::Platform(format!(
                 "send_keystroke: target pid {} not foreground (was {front_pid})",
@@ -175,9 +188,18 @@ impl WindowsHandle {
             }
         }
 
-        // The chord is now queued to the target's input thread (it'll be drained
-        // by Studio's event loop regardless of focus), so hand focus back to
-        // whatever was foreground before — best-effort, keeps the steal invisible.
+        // Keep the target foregrounded briefly before yielding focus.
+        // keybd_event events are routed to whichever window is foreground when
+        // the raw-input thread drains them — NOT to a private per-window queue.
+        // So if we restore the previous foreground (or let the next queued save
+        // steal focus) before Studio's event loop has processed the Ctrl+S
+        // accelerator, the chord lands on the wrong window and the save never
+        // fires (the place mtime never changes → caller times out). This hold
+        // runs under KEYSTROKE_LOCK, so the next save still can't preempt it.
+        std::thread::sleep(Duration::from_millis(400));
+
+        // Hand focus back to whatever was foreground before — best-effort,
+        // keeps the steal invisible.
         if !prev_foreground.is_null() && prev_foreground != hwnd {
             force_foreground(prev_foreground);
         }
@@ -255,6 +277,18 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<crate::Child> {
         }
     }
 
+    // Detached shell-open: launch the app *through* explorer by opening its
+    // first argument (e.g. a place file) via the shell. The running shell
+    // becomes the app's parent, so it's rooted at a persistent process, escapes
+    // any job/parent chain we're in, and — for Roblox Studio — opens as a single
+    // process with no bootstrapper handoff. The transient `explorer.exe` we
+    // spawn hands the open to the running shell and exits; adoption (below)
+    // finds the real app by its exe name. See `Command::shell_open`.
+    let via_shell = cmd.detached && cmd.shell_open && !cmd.args.is_empty();
+    if via_shell {
+        cmd_line = format!("explorer.exe \"{}\"", cmd.args[0]);
+    }
+
     // Convert to null-terminated UTF-16
     let mut wide_cmd: Vec<u16> = cmd_line.encode_utf16().collect();
     wide_cmd.push(0);
@@ -271,7 +305,12 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<crate::Child> {
     // Wire up stdout/stderr capture when requested — parity with the macOS
     // pty-backed stdio. The child inherits the (inheritable) pipe write ends via
     // STARTF_USESTDHANDLES + bInheritHandles; we keep + drain the read ends.
-    let want_capture = cmd.stdout_cfg.is_some() || cmd.stderr_cfg.is_some();
+    //
+    // Shell-open is exempt: explorer won't pass our pipes to the shell-launched
+    // app anyway, and STARTF_USESTDHANDLES makes the transient explorer open the
+    // app itself instead of delegating to the running shell — which reintroduces
+    // the parent tie + bootstrapper handoff we're trying to avoid.
+    let want_capture = !via_shell && (cmd.stdout_cfg.is_some() || cmd.stderr_cfg.is_some());
     let mut stdout_read: Option<HANDLE> = None;
     let mut stderr_read: Option<HANDLE> = None;
     let mut write_ends: Vec<HANDLE> = Vec::new();
@@ -359,7 +398,7 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<crate::Child> {
     // exit would otherwise look like a launch failure while the app is up).
     // Apps that don't hand off are returned unchanged.
     let (pid, process_handle) =
-        adopt_real_process(&exe_name, &pre_pids, pi.dwProcessId, pi.hProcess);
+        adopt_real_process(&exe_name, &pre_pids, pi.dwProcessId, pi.hProcess, via_shell);
 
     // Bind non-detached apps to our lifetime job so the OS tears them down when
     // this process exits — even on an uncatchable TerminateProcess, where no
@@ -540,6 +579,7 @@ fn adopt_real_process(
     pre: &HashSet<u32>,
     launched_pid: u32,
     launched_handle: HANDLE,
+    via_intermediary: bool,
 ) -> (u32, HANDLE) {
     let start = Instant::now();
     let deadline = start + ADOPT_DEADLINE;
@@ -575,7 +615,10 @@ fn adopt_real_process(
 
         // Launched process died with no sibling to adopt → genuine early exit.
         // Hand back the (dead) launched handle so the caller observes the exit.
-        if !launched_alive && siblings.is_empty() {
+        // Exception: a shell-open launches a transient `explorer.exe` that exits
+        // by design once it hands the open to the running shell — keep polling
+        // for the real app (up to the deadline) instead of treating it as a fail.
+        if !launched_alive && siblings.is_empty() && !via_intermediary {
             return (launched_pid, launched_handle);
         }
 
