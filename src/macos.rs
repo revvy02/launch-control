@@ -56,6 +56,22 @@ impl MacOSHandle {
         let flags = modifiers_to_cg_flags(modifiers);
         send_keystroke_to_pid(self.pid, keycode, flags)
     }
+
+    /// Press the menu item whose key equivalent is ⌘+`ch` via the
+    /// Accessibility API (AXPress). Unlike keystroke injection this targets
+    /// the process directly, requires no focus, and is immune to the
+    /// Qt event-queue drain problem — the menu action runs even when the
+    /// app is backgrounded or hidden.
+    pub fn press_menu_cmd_char(&self, ch: char) -> Result<()> {
+        ax::press_menu_item_by_cmd_char(self.pid, ch)
+    }
+
+    /// Press the menu item with the exact title `item_title` in the menu-bar
+    /// menu titled `menu_title` via the Accessibility API (AXPress). For apps
+    /// that bind shortcuts internally without exposing AXMenuItemCmdChar.
+    pub fn press_menu_item(&self, menu_title: &str, item_title: &str) -> Result<()> {
+        ax::press_menu_item_by_title(self.pid, menu_title, item_title)
+    }
 }
 
 // CoreGraphics FFI for posting keyboard events.
@@ -218,6 +234,308 @@ fn send_keystroke_to_pid(pid: u32, keycode: u16, flags: u64) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Accessibility (AXUIElement) bindings for invoking menu items directly.
+///
+/// Menu actions performed through AXPress run in the target regardless of
+/// focus or activation state — the window server delivers them to the app's
+/// NSMenu machinery, not through the keyboard event queue. This sidesteps
+/// both failure modes of synthetic keystrokes:
+///  - CGEventPostToPid lands in the target's private Carbon queue, which Qt
+///    only drains on inactive→active transitions (dropped while background).
+///  - CGEventPost(kCGSessionEventTap) goes to whichever app is frontmost,
+///    which a CLI process often cannot make the target (cooperative
+///    activation on modern macOS denies focus steals).
+///
+/// Uses the same TCC Accessibility right as CGEvent injection.
+mod ax {
+    use crate::error::{Error, Result};
+    use std::ffi::c_void;
+
+    type CFTypeRef = *const c_void;
+    type CFStringRef = *const c_void;
+    type CFArrayRef = *const c_void;
+    type CFIndex = isize;
+    type AXUIElementRef = *const c_void;
+    type AXError = i32;
+    type Boolean = u8;
+
+    const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+    const K_CF_NUMBER_SINT32_TYPE: CFIndex = 3;
+    const K_AX_ERROR_SUCCESS: AXError = 0;
+
+    #[link(name = "ApplicationServices", kind = "framework")]
+    unsafe extern "C" {
+        fn AXIsProcessTrusted() -> Boolean;
+        fn AXUIElementCreateApplication(pid: libc::pid_t) -> AXUIElementRef;
+        fn AXUIElementCopyAttributeValue(
+            element: AXUIElementRef,
+            attribute: CFStringRef,
+            value: *mut CFTypeRef,
+        ) -> AXError;
+        fn AXUIElementPerformAction(element: AXUIElementRef, action: CFStringRef) -> AXError;
+        fn AXUIElementSetMessagingTimeout(element: AXUIElementRef, timeout_secs: f32) -> AXError;
+        fn AXUIElementCreateSystemWide() -> AXUIElementRef;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFStringCreateWithCString(
+            alloc: *const c_void,
+            c_str: *const i8,
+            encoding: u32,
+        ) -> CFStringRef;
+        fn CFStringGetCString(
+            string: CFStringRef,
+            buffer: *mut i8,
+            buffer_size: CFIndex,
+            encoding: u32,
+        ) -> Boolean;
+        fn CFArrayGetCount(array: CFArrayRef) -> CFIndex;
+        fn CFArrayGetValueAtIndex(array: CFArrayRef, idx: CFIndex) -> *const c_void;
+        fn CFNumberGetValue(number: CFTypeRef, the_type: CFIndex, value_ptr: *mut c_void) -> Boolean;
+        fn CFBooleanGetValue(boolean: CFTypeRef) -> Boolean;
+        // CFRelease is declared (with a *mut signature) in cg_ffi; reuse it.
+    }
+
+    use super::cg_ffi::CFRelease;
+
+    /// Owned CFTypeRef released on drop. Null-safe.
+    struct CFOwned(CFTypeRef);
+    impl Drop for CFOwned {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { CFRelease(self.0 as *mut c_void) };
+            }
+        }
+    }
+
+    /// NUL-terminated static names for the AX string constants we need —
+    /// avoids depending on the framework-exported CFString globals.
+    fn cf_string(name: &'static str) -> CFOwned {
+        debug_assert!(name.ends_with('\0'));
+        CFOwned(unsafe {
+            CFStringCreateWithCString(
+                std::ptr::null(),
+                name.as_ptr() as *const i8,
+                K_CF_STRING_ENCODING_UTF8,
+            )
+        })
+    }
+
+    /// Copy an attribute value; Ok(None) when the attribute is unsupported
+    /// or empty for this element (common: separators have no cmd char).
+    fn copy_attr(element: AXUIElementRef, attribute: &'static str) -> Option<CFOwned> {
+        let attr = cf_string(attribute);
+        let mut value: CFTypeRef = std::ptr::null();
+        let err = unsafe { AXUIElementCopyAttributeValue(element, attr.0, &mut value) };
+        if err == K_AX_ERROR_SUCCESS && !value.is_null() {
+            Some(CFOwned(value))
+        } else {
+            None
+        }
+    }
+
+    /// Like `copy_attr` but surfaces the AXError code — use where "the app
+    /// didn't respond" (kAXErrorCannotComplete = -25204, common on a busy or
+    /// still-launching target) must be distinguishable from "attribute
+    /// genuinely absent".
+    fn copy_attr_err(element: AXUIElementRef, attribute: &'static str) -> std::result::Result<CFOwned, AXError> {
+        let attr = cf_string(attribute);
+        let mut value: CFTypeRef = std::ptr::null();
+        let err = unsafe { AXUIElementCopyAttributeValue(element, attr.0, &mut value) };
+        if err == K_AX_ERROR_SUCCESS && !value.is_null() {
+            Ok(CFOwned(value))
+        } else {
+            Err(err)
+        }
+    }
+
+    fn bool_of(value: &CFOwned) -> Option<bool> {
+        if value.0.is_null() {
+            return None;
+        }
+        Some(unsafe { CFBooleanGetValue(value.0) } != 0)
+    }
+
+    /// Unhide the app via NSRunningApplication (no activation / focus steal).
+    /// Menu items of hidden apps can report AXEnabled=false; unhiding lets
+    /// the app validate its menus without taking focus from the user.
+    fn unhide_app(pid: u32) {
+        use objc2_app_kit::NSRunningApplication;
+        if let Some(app) = NSRunningApplication::runningApplicationWithProcessIdentifier(pid as libc::pid_t) {
+            if app.isHidden() {
+                app.unhide();
+            }
+        }
+    }
+
+    fn string_of(value: &CFOwned) -> Option<String> {
+        let mut buf = [0i8; 64];
+        let ok = unsafe {
+            CFStringGetCString(value.0, buf.as_mut_ptr(), buf.len() as CFIndex, K_CF_STRING_ENCODING_UTF8)
+        };
+        if ok == 0 {
+            return None;
+        }
+        let cstr = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
+        cstr.to_str().ok().map(|s| s.to_string())
+    }
+
+    fn i32_of(value: &CFOwned) -> Option<i32> {
+        let mut out: i32 = 0;
+        let ok = unsafe {
+            CFNumberGetValue(value.0, K_CF_NUMBER_SINT32_TYPE, &mut out as *mut i32 as *mut c_void)
+        };
+        (ok != 0).then_some(out)
+    }
+
+    /// Walk every (menu-bar title, menu item) pair in the app's menu bar,
+    /// calling `pred(bar_title, item)` until it returns true — then AXPress
+    /// that item. `desc` labels error messages.
+    ///
+    /// Reliability measures (each one is load-bearing, observed in practice):
+    /// - 1s messaging timeout: AX queries to a busy/launching app otherwise
+    ///   block ~6s per call (a single press was observed taking 25s); fail
+    ///   fast instead and let the caller's retry loop re-enter.
+    /// - kAXErrorCannotComplete is surfaced distinctly: it means "app not
+    ///   responding to accessibility", not "menu absent".
+    /// - AXEnabled gate: AXPress on a disabled item reports success but does
+    ///   nothing (observed: hidden Studio's File > Save to File no-ops). A
+    ///   hidden app may not validate menus — unhide (no focus steal) and
+    ///   re-check once before giving up.
+    unsafe fn press_first_matching(
+        pid: u32,
+        desc: &str,
+        mut pred: impl FnMut(&str, AXUIElementRef) -> bool,
+    ) -> Result<()> {
+        unsafe {
+            if AXIsProcessTrusted() == 0 {
+                return Err(Error::Platform(
+                    "accessibility permission not granted (AXIsProcessTrusted=false)".into(),
+                ));
+            }
+            let app = CFOwned(AXUIElementCreateApplication(pid as libc::pid_t) as CFTypeRef);
+            if app.0.is_null() {
+                return Err(Error::Platform("AXUIElementCreateApplication returned null".into()));
+            }
+            // Fail fast on unresponsive targets; the caller retries. Set on the
+            // system-wide element: per-app timeouts don't propagate to element
+            // refs copied out of attributes (observed: a query against a
+            // still-launching Studio blocked ~25s despite an app-element
+            // timeout), while the system-wide element changes this process's
+            // default for all AX messaging.
+            let systemwide = CFOwned(AXUIElementCreateSystemWide() as CFTypeRef);
+            let _ = AXUIElementSetMessagingTimeout(systemwide.0 as AXUIElementRef, 1.0);
+            let _ = AXUIElementSetMessagingTimeout(app.0 as AXUIElementRef, 1.0);
+
+            let menubar = match copy_attr_err(app.0, "AXMenuBar\0") {
+                Ok(v) => v,
+                Err(-25204) => {
+                    return Err(Error::Platform(
+                        "app not responding to accessibility queries (kAXErrorCannotComplete)".into(),
+                    ))
+                }
+                Err(code) => {
+                    return Err(Error::Platform(format!(
+                        "app has no accessible menu bar (AXError {code})"
+                    )))
+                }
+            };
+            let bar_items = copy_attr(menubar.0, "AXChildren\0")
+                .ok_or_else(|| Error::Platform("menu bar has no children".into()))?;
+
+            for i in 0..CFArrayGetCount(bar_items.0) {
+                // Borrowed (Get-rule) — do not release array elements.
+                let bar_item = CFArrayGetValueAtIndex(bar_items.0, i);
+                let bar_title = copy_attr(bar_item, "AXTitle\0")
+                    .and_then(|t| string_of(&t))
+                    .unwrap_or_default();
+                let Some(menus) = copy_attr(bar_item, "AXChildren\0") else { continue };
+                for j in 0..CFArrayGetCount(menus.0) {
+                    let menu = CFArrayGetValueAtIndex(menus.0, j);
+                    let Some(items) = copy_attr(menu, "AXChildren\0") else { continue };
+                    for k in 0..CFArrayGetCount(items.0) {
+                        let item = CFArrayGetValueAtIndex(items.0, k);
+                        if !pred(&bar_title, item) {
+                            continue;
+                        }
+                        let title = copy_attr(item, "AXTitle\0")
+                            .and_then(|t| string_of(&t))
+                            .unwrap_or_default();
+
+                        // Disabled items swallow AXPress silently. Hidden apps
+                        // may keep items unvalidated/disabled — unhide (does
+                        // not take focus) and give the app a beat to validate.
+                        let enabled = |item: AXUIElementRef| {
+                            copy_attr(item, "AXEnabled\0").and_then(|v| bool_of(&v))
+                        };
+                        if enabled(item) == Some(false) {
+                            unhide_app(pid);
+                            std::thread::sleep(std::time::Duration::from_millis(300));
+                            if enabled(item) == Some(false) {
+                                return Err(Error::Platform(format!(
+                                    "menu item '{title}' is disabled (even after unhide)"
+                                )));
+                            }
+                        }
+
+                        let action = cf_string("AXPress\0");
+                        let err = AXUIElementPerformAction(item, action.0);
+                        if err == K_AX_ERROR_SUCCESS {
+                            tracing::info!(pid, title = title.as_str(), "ax: pressed menu item ({desc})");
+                            return Ok(());
+                        }
+                        return Err(Error::Platform(format!(
+                            "AXPress on menu item '{title}' failed (AXError {err})"
+                        )));
+                    }
+                }
+            }
+            Err(Error::Platform(format!("no menu item matching {desc} found")))
+        }
+    }
+
+    /// AXPress the item titled `item_title` inside the menu titled
+    /// `menu_title`. Exact title matches — the reliable route for apps (like
+    /// Qt's Roblox Studio) that bind shortcuts internally without exposing
+    /// AXMenuItemCmdChar on the item.
+    pub(super) fn press_menu_item_by_title(pid: u32, menu_title: &str, item_title: &str) -> Result<()> {
+        unsafe {
+            press_first_matching(pid, &format!("'{menu_title}' > '{item_title}'"), |bar, item| {
+                bar == menu_title
+                    && copy_attr(item, "AXTitle\0")
+                        .and_then(|t| string_of(&t))
+                        .as_deref()
+                        == Some(item_title)
+            })
+        }
+    }
+
+    /// Find the menu item whose key equivalent is plain ⌘+`ch`
+    /// (AXMenuItemCmdModifiers == 0 means "Command only") anywhere in the
+    /// app's menu bar, and AXPress it.
+    pub(super) fn press_menu_item_by_cmd_char(pid: u32, ch: char) -> Result<()> {
+        let want = ch.to_ascii_uppercase().to_string();
+        unsafe {
+            press_first_matching(pid, &format!("plain ⌘{ch} key equivalent"), |_, item| {
+                let char_matches = copy_attr(item, "AXMenuItemCmdChar\0")
+                    .and_then(|c| string_of(&c))
+                    .as_deref()
+                    == Some(want.as_str());
+                if !char_matches {
+                    return false;
+                }
+                // 0 = Command with no extra modifiers; ⇧⌘ etc. are nonzero,
+                // and we only want the plain chord.
+                copy_attr(item, "AXMenuItemCmdModifiers\0")
+                    .and_then(|m| i32_of(&m))
+                    .unwrap_or(-1)
+                    == 0
+            })
+        }
+    }
 }
 
 /// Check if a process has exited. Returns synthetic ExitStatus.

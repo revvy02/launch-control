@@ -372,6 +372,43 @@ impl Child {
         }
     }
 
+    /// Press the menu item bound to ⌘+`ch` via the Accessibility API
+    /// (macOS only). Targets the process directly with no focus requirement —
+    /// more reliable than synthetic keystrokes for menu-bound shortcuts.
+    pub fn press_menu_cmd_char(&self, ch: char) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            return match self.inner {
+                Some(ref inner) => inner.press_menu_cmd_char(ch),
+                None => Err(Error::Platform("no GUI handle available".into())),
+            };
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = ch;
+            Err(Error::Unsupported)
+        }
+    }
+
+    /// Press the menu item with the exact title `item_title` in the menu-bar
+    /// menu titled `menu_title` via the Accessibility API (macOS only). For
+    /// apps that bind shortcuts internally without exposing the key
+    /// equivalent on the menu item (e.g. Qt apps like Roblox Studio).
+    pub fn press_menu_item(&self, menu_title: &str, item_title: &str) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            return match self.inner {
+                Some(ref inner) => inner.press_menu_item(menu_title, item_title),
+                None => Err(Error::Platform("no GUI handle available".into())),
+            };
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (menu_title, item_title);
+            Err(Error::Unsupported)
+        }
+    }
+
     /// Send a keystroke to the process. Does not require the app to be focused.
     ///
     /// Uses `CGEventPostToPSN` on macOS to post directly to the process's event queue.
