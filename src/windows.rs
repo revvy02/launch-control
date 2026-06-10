@@ -32,9 +32,10 @@ use windows_sys::Win32::System::JobObjects::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, EnumWindows, GetForegroundWindow, GetWindow, GetWindowTextLengthW,
-    GetWindowThreadProcessId, IsWindowVisible, SetForegroundWindow, ShowWindow, GW_OWNER,
-    SW_SHOWMINNOACTIVE, SW_SHOWNORMAL,
+    GetWindowThreadProcessId, IsIconic, IsWindowVisible, SetForegroundWindow, ShowWindow,
+    GW_OWNER, SW_RESTORE, SW_SHOWMINNOACTIVE, SW_SHOWNORMAL,
 };
+use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{keybd_event, KEYEVENTF_KEYUP};
 use keyboard_types::{Code, Modifiers};
 
@@ -398,7 +399,7 @@ pub(crate) fn spawn(cmd: &mut Command) -> Result<crate::Child> {
     // exit would otherwise look like a launch failure while the app is up).
     // Apps that don't hand off are returned unchanged.
     let (pid, process_handle) =
-        adopt_real_process(&exe_name, &pre_pids, pi.dwProcessId, pi.hProcess, via_shell);
+        adopt_real_process(&exe_name, &pre_pids, pi.dwProcessId, pi.hProcess, via_shell, &cmd.args);
 
     // Bind non-detached apps to our lifetime job so the OS tears them down when
     // this process exits — even on an uncatchable TerminateProcess, where no
@@ -567,6 +568,88 @@ fn bind_to_lifetime_job(process_handle: HANDLE) {
     }
 }
 
+/// Read another process's command line via `NtQueryInformationProcess` +
+/// `ReadProcessMemory` of the PEB (x64 offsets: `ProcessParameters` at
+/// PEB+0x20, `CommandLine` UNICODE_STRING at params+0x70). Returns `None` if
+/// the process is gone, unreadable, or mid-exit — callers treat that as
+/// "identity unknown", not as a match.
+fn proc_cmdline(pid: u32) -> Option<String> {
+    #[repr(C)]
+    struct ProcessBasicInformation {
+        exit_status: isize,
+        peb_base: usize,
+        affinity: usize,
+        base_priority: isize,
+        unique_pid: usize,
+        parent_pid: usize,
+    }
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtQueryInformationProcess(
+            handle: HANDLE,
+            class: u32,
+            info: *mut core::ffi::c_void,
+            len: u32,
+            ret_len: *mut u32,
+        ) -> i32;
+    }
+    const PROCESS_VM_READ: u32 = 0x0010;
+    const PROCESS_QUERY_INFORMATION: u32 = 0x0400;
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid);
+        if handle.is_null() {
+            return None;
+        }
+        // Everything below must CloseHandle on the way out.
+        let result = (|| {
+            let mut pbi: ProcessBasicInformation = mem::zeroed();
+            let mut ret_len = 0u32;
+            if NtQueryInformationProcess(
+                handle,
+                0, // ProcessBasicInformation
+                &mut pbi as *mut _ as *mut _,
+                mem::size_of::<ProcessBasicInformation>() as u32,
+                &mut ret_len,
+            ) != 0
+                || pbi.peb_base == 0
+            {
+                return None;
+            }
+            let read = |addr: usize, buf: *mut u8, len: usize| -> bool {
+                let mut got = 0usize;
+                ReadProcessMemory(handle, addr as *const _, buf as *mut _, len, &mut got) != 0
+                    && got == len
+            };
+            // PEB+0x20 → RTL_USER_PROCESS_PARAMETERS*
+            let mut params_ptr = 0usize;
+            if !read(pbi.peb_base + 0x20, &mut params_ptr as *mut _ as *mut u8, 8) || params_ptr == 0 {
+                return None;
+            }
+            // params+0x70 → UNICODE_STRING CommandLine { u16 len, u16 cap, pad, ptr at +8 }
+            let mut len_bytes = 0u16;
+            if !read(params_ptr + 0x70, &mut len_bytes as *mut _ as *mut u8, 2) || len_bytes == 0 {
+                return None;
+            }
+            let mut buf_ptr = 0usize;
+            if !read(params_ptr + 0x78, &mut buf_ptr as *mut _ as *mut u8, 8) || buf_ptr == 0 {
+                return None;
+            }
+            let mut wide = vec![0u16; (len_bytes / 2) as usize];
+            if !read(buf_ptr, wide.as_mut_ptr() as *mut u8, len_bytes as usize) {
+                return None;
+            }
+            Some(String::from_utf16_lossy(&wide))
+        })();
+        CloseHandle(handle);
+        result
+    }
+}
+
+/// How long to require cmdline-verified identity before falling back to an
+/// unverified windowed sibling (cmdline unreadable / argless launches only).
+const VERIFY_FALLBACK: Duration = Duration::from_secs(5);
+
 /// Resolve the real GUI process to track after a possible bootstrapper handoff.
 ///
 /// Strategy: poll for a same-exe process that is new since launch (not in
@@ -574,16 +657,37 @@ fn bind_to_lifetime_job(process_handle: HANDLE) {
 /// — that's the relaunched editor. Adopt it. If no sibling ever appears within
 /// the grace window, the launched process didn't hand off and IS the app, so
 /// track it unchanged. Falls back to the launched process on timeout.
+///
+/// Concurrency safety (mirrors macOS's argv-verified claim): a sibling is only
+/// adopted if its command line contains all of `args` — under concurrent
+/// launches the snapshot diff alone happily claims a *different* launcher's
+/// editor (observed: two legs tracking the same pid; one leg's teardown then
+/// killed the other's Studio mid-run and the third Studio leaked). Siblings
+/// whose cmdline is readable but mismatched are never adopted; unreadable ones
+/// only after `VERIFY_FALLBACK`, preserving the old behavior for argless
+/// launches.
 fn adopt_real_process(
     exe_name: &str,
     pre: &HashSet<u32>,
     launched_pid: u32,
     launched_handle: HANDLE,
     via_intermediary: bool,
+    args: &[String],
 ) -> (u32, HANDLE) {
     let start = Instant::now();
     let deadline = start + ADOPT_DEADLINE;
     loop {
+        let launched_alive = process_alive(launched_handle);
+
+        // Fast path: our own launched process is alive and owns a window — it
+        // IS the editor (no handoff happened). Never consider siblings; under
+        // concurrent launches they're other launchers' Studios. (Skipped for
+        // shell-open: the launched process is a transient explorer.exe, which
+        // always has windows.)
+        if !via_intermediary && launched_alive && find_window_by_pid(launched_pid).is_some() {
+            return (launched_pid, launched_handle);
+        }
+
         let current = pids_for_exe(exe_name);
         let siblings: Vec<u32> = current
             .iter()
@@ -591,8 +695,18 @@ fn adopt_real_process(
             .filter(|p| !pre.contains(p) && *p != launched_pid)
             .collect();
 
-        // A windowed sibling is the relaunched editor — adopt it.
-        if let Some(&editor) = siblings.iter().find(|&&p| find_window_by_pid(p).is_some()) {
+        // A windowed sibling whose cmdline carries our launch args is our
+        // relaunched editor — adopt it. Unverifiable (cmdline unreadable)
+        // siblings are only eligible after VERIFY_FALLBACK.
+        let editor = siblings
+            .iter()
+            .copied()
+            .filter(|&p| find_window_by_pid(p).is_some())
+            .find(|&p| match proc_cmdline(p) {
+                Some(cmdline) => args.iter().all(|a| cmdline.contains(a.as_str())),
+                None => args.is_empty() || start.elapsed() >= VERIFY_FALLBACK,
+            });
+        if let Some(editor) = editor {
             if let Some(h) = open_tracked_handle(editor) {
                 tracing::info!(
                     bootstrapper_pid = launched_pid,
@@ -604,8 +718,6 @@ fn adopt_real_process(
                 return (editor, h);
             }
         }
-
-        let launched_alive = process_alive(launched_handle);
 
         // No handoff: launched process is still alive, no same-exe sibling has
         // appeared, and the grace window has elapsed → it IS the app.
@@ -724,7 +836,15 @@ fn force_foreground(hwnd: HWND) -> u32 {
         if attach {
             AttachThreadInput(our_thread, fg_thread, 1);
         }
-        ShowWindow(hwnd, SW_SHOWNORMAL);
+        // Only change the show state if the window is minimized — and then
+        // with SW_RESTORE, which honors a maximized previous state.
+        // SW_SHOWNORMAL here would un-maximize whatever window we're
+        // foregrounding: with the post-keystroke focus hand-back, that meant
+        // every save knocked the user's maximized editor down to its
+        // "normal" rect.
+        if IsIconic(hwnd) != 0 {
+            ShowWindow(hwnd, SW_RESTORE);
+        }
         BringWindowToTop(hwnd);
         SetForegroundWindow(hwnd);
         if attach {
