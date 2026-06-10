@@ -740,6 +740,69 @@ fn spawn_simple(cmd: &mut Command) -> Result<crate::Child> {
 /// Uses `open -g -j` (inside the helper) for clean background launch (no
 /// focus steal, no Dock activation). Returns an `NSRunningApplication`-backed
 /// `Child` for focus/kill/keystroke support.
+/// Read a process's argv via `sysctl KERN_PROCARGS2`. Returns None if the
+/// process is gone, unreadable (different user), or mid-exec.
+///
+/// Buffer layout: `argc: i32 | exec_path\0 | \0 padding... | argv[0]\0 ...`.
+fn proc_argv(pid: i32) -> Option<Vec<String>> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    let mut size: libc::size_t = 0;
+    let rc = unsafe {
+        libc::sysctl(mib.as_mut_ptr(), 3, std::ptr::null_mut(), &mut size, std::ptr::null_mut(), 0)
+    };
+    if rc != 0 || size < 4 {
+        return None;
+    }
+    let mut buf = vec![0u8; size];
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || size < 4 {
+        return None;
+    }
+    buf.truncate(size);
+
+    let argc = i32::from_ne_bytes(buf[0..4].try_into().ok()?) as usize;
+    let rest = &buf[4..];
+    // Skip exec_path (first NUL-terminated string), then the NUL padding run.
+    let exec_end = rest.iter().position(|&b| b == 0)?;
+    let mut idx = exec_end;
+    while idx < rest.len() && rest[idx] == 0 {
+        idx += 1;
+    }
+    let mut args = Vec::with_capacity(argc);
+    let mut start = idx;
+    for i in idx..rest.len() {
+        if rest[i] == 0 {
+            args.push(String::from_utf8_lossy(&rest[start..i]).into_owned());
+            start = i + 1;
+            if args.len() == argc {
+                break;
+            }
+        }
+    }
+    Some(args)
+}
+
+/// Whether `haystack` (a process argv) contains `needle` as a contiguous
+/// subsequence. `open --args` forwards our args verbatim, so the launched
+/// instance's argv ends with exactly the args we passed.
+fn argv_contains_args(haystack: &[String], needle: &[String]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    haystack
+        .windows(needle.len())
+        .any(|w| w == needle)
+}
+
 fn spawn_piped(cmd: &mut Command) -> Result<crate::Child> {
     let path = &cmd.path;
 
@@ -793,18 +856,53 @@ fn spawn_piped(cmd: &mut Command) -> Result<crate::Child> {
     let mut helper_child = helper_cmd.spawn()
         .map_err(|e| Error::Platform(format!("failed to spawn launch-control helper ({} {}): {e}", helper_bin.display(), helper_prefix.join(" "))))?;
 
-    // Find the new PID by diffing against the snapshot. The helper kicks off
-    // `open` which spawns the app; the app is in NSRunningApplication's list
-    // shortly after.
+    // Find the new PID by diffing against the snapshot, VERIFIED by argv.
+    // The in-process SPAWN_PIPED_LOCK can't serialize claims across processes
+    // (each `rodeo run` is its own process), and the bare "first unseen pid"
+    // diff mis-claims under concurrent same-bundle launches — observed: two
+    // launchers claiming the same Studio pid, leaving the third Studio
+    // orphaned and a sibling's Studio killed by the wrong owner's cleanup.
+    // Our args are launcher-unique in practice (unique temp place path,
+    // -parentPid <our pid>), so requiring the candidate's argv to contain
+    // exactly the args we passed makes the claim deterministic — including
+    // against Studios launched concurrently by other processes or humans.
+    // Fall back to the unverified diff only after the verified search has
+    // had ample time (covers argless launches and argv-read failures).
     let pid = (|| -> Option<u32> {
-        for _ in 0..50 {
+        let mut unverified_fallback: Option<u32> = None;
+        for attempt in 0..50 {
             let current = NSRunningApplication::runningApplicationsWithBundleIdentifier(
                 &objc2_foundation::NSString::from_str(&bundle_id),
             );
             for app in current.iter() {
                 let p = app.processIdentifier();
-                if p > 0 && !before_pids.contains(&p) {
+                if p <= 0 || before_pids.contains(&p) {
+                    continue;
+                }
+                if cmd.args.is_empty() {
                     return Some(p as u32);
+                }
+                match proc_argv(p) {
+                    Some(argv) if argv_contains_args(&argv, &cmd.args) => {
+                        return Some(p as u32);
+                    }
+                    _ => {
+                        // New pid for our bundle but not our argv (sibling
+                        // launcher's instance, or argv unreadable). Remember
+                        // it as a last-resort fallback.
+                        unverified_fallback = Some(p as u32);
+                    }
+                }
+            }
+            // After 5s without an argv-verified match, accept the unverified
+            // candidate rather than failing the launch outright.
+            if attempt >= 25 {
+                if let Some(p) = unverified_fallback {
+                    tracing::warn!(
+                        pid = p,
+                        "spawn_piped: claiming pid WITHOUT argv verification (no candidate matched our args)",
+                    );
+                    return Some(p);
                 }
             }
             // Helper bails fast on bad args; if it died before the app
