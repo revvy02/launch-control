@@ -72,6 +72,15 @@ impl MacOSHandle {
     pub fn press_menu_item(&self, menu_title: &str, item_title: &str) -> Result<()> {
         ax::press_menu_item_by_title(self.pid, menu_title, item_title)
     }
+
+    /// Read-only probe: walk the menu bar and report whether the item exists.
+    /// Useful to pre-warm the target's accessibility connection — the first
+    /// AX contact with a freshly-launched app can block for many seconds
+    /// while it settles; doing that walk in the background at launch makes
+    /// later `press_menu_item` calls respond in milliseconds.
+    pub fn find_menu_item(&self, menu_title: &str, item_title: &str) -> Result<bool> {
+        ax::find_menu_item_by_title(self.pid, menu_title, item_title)
+    }
 }
 
 // CoreGraphics FFI for posting keyboard events.
@@ -392,8 +401,9 @@ mod ax {
     }
 
     /// Walk every (menu-bar title, menu item) pair in the app's menu bar,
-    /// calling `pred(bar_title, item)` until it returns true — then AXPress
-    /// that item. `desc` labels error messages.
+    /// calling `pred(bar_title, item)` until it returns true — then run
+    /// `on_match(item, title)` and return Ok(Some(its result)). Ok(None) when
+    /// nothing matched.
     ///
     /// Reliability measures (each one is load-bearing, observed in practice):
     /// - 1s messaging timeout: AX queries to a busy/launching app otherwise
@@ -401,15 +411,11 @@ mod ax {
     ///   fast instead and let the caller's retry loop re-enter.
     /// - kAXErrorCannotComplete is surfaced distinctly: it means "app not
     ///   responding to accessibility", not "menu absent".
-    /// - AXEnabled gate: AXPress on a disabled item reports success but does
-    ///   nothing (observed: hidden Studio's File > Save to File no-ops). A
-    ///   hidden app may not validate menus — unhide (no focus steal) and
-    ///   re-check once before giving up.
-    unsafe fn press_first_matching(
+    unsafe fn walk_first_matching<R>(
         pid: u32,
-        desc: &str,
         mut pred: impl FnMut(&str, AXUIElementRef) -> bool,
-    ) -> Result<()> {
+        on_match: impl FnOnce(AXUIElementRef, &str) -> R,
+    ) -> Result<Option<R>> {
         unsafe {
             if AXIsProcessTrusted() == 0 {
                 return Err(Error::Platform(
@@ -464,36 +470,52 @@ mod ax {
                         let title = copy_attr(item, "AXTitle\0")
                             .and_then(|t| string_of(&t))
                             .unwrap_or_default();
-
-                        // Disabled items swallow AXPress silently. Hidden apps
-                        // may keep items unvalidated/disabled — unhide (does
-                        // not take focus) and give the app a beat to validate.
-                        let enabled = |item: AXUIElementRef| {
-                            copy_attr(item, "AXEnabled\0").and_then(|v| bool_of(&v))
-                        };
-                        if enabled(item) == Some(false) {
-                            unhide_app(pid);
-                            std::thread::sleep(std::time::Duration::from_millis(300));
-                            if enabled(item) == Some(false) {
-                                return Err(Error::Platform(format!(
-                                    "menu item '{title}' is disabled (even after unhide)"
-                                )));
-                            }
-                        }
-
-                        let action = cf_string("AXPress\0");
-                        let err = AXUIElementPerformAction(item, action.0);
-                        if err == K_AX_ERROR_SUCCESS {
-                            tracing::info!(pid, title = title.as_str(), "ax: pressed menu item ({desc})");
-                            return Ok(());
-                        }
-                        return Err(Error::Platform(format!(
-                            "AXPress on menu item '{title}' failed (AXError {err})"
-                        )));
+                        return Ok(Some(on_match(item, &title)));
                     }
                 }
             }
-            Err(Error::Platform(format!("no menu item matching {desc} found")))
+            Ok(None)
+        }
+    }
+
+    /// AXPress gate + action for a matched item. Disabled items swallow
+    /// AXPress silently (observed: hidden Studio's File > Save to File
+    /// no-ops). A hidden app may not validate menus — unhide (no focus
+    /// steal) and re-check once before giving up.
+    unsafe fn press_first_matching(
+        pid: u32,
+        desc: &str,
+        pred: impl FnMut(&str, AXUIElementRef) -> bool,
+    ) -> Result<()> {
+        let pressed = unsafe {
+            walk_first_matching(pid, pred, |item, title| {
+                let enabled = |item: AXUIElementRef| {
+                    copy_attr(item, "AXEnabled\0").and_then(|v| bool_of(&v))
+                };
+                if enabled(item) == Some(false) {
+                    unhide_app(pid);
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    if enabled(item) == Some(false) {
+                        return Err(Error::Platform(format!(
+                            "menu item '{title}' is disabled (even after unhide)"
+                        )));
+                    }
+                }
+                let action = cf_string("AXPress\0");
+                let err = AXUIElementPerformAction(item, action.0);
+                if err == K_AX_ERROR_SUCCESS {
+                    tracing::info!(pid, title, "ax: pressed menu item ({desc})");
+                    Ok(())
+                } else {
+                    Err(Error::Platform(format!(
+                        "AXPress on menu item '{title}' failed (AXError {err})"
+                    )))
+                }
+            })?
+        };
+        match pressed {
+            Some(result) => result,
+            None => Err(Error::Platform(format!("no menu item matching {desc} found"))),
         }
     }
 
@@ -510,6 +532,26 @@ mod ax {
                         .as_deref()
                         == Some(item_title)
             })
+        }
+    }
+
+    /// Read-only existence probe for a menu item (no AXPress). Walks the same
+    /// path as the press, so it exercises (and warms) the target's
+    /// accessibility connection.
+    pub(super) fn find_menu_item_by_title(pid: u32, menu_title: &str, item_title: &str) -> Result<bool> {
+        unsafe {
+            walk_first_matching(
+                pid,
+                |bar, item| {
+                    bar == menu_title
+                        && copy_attr(item, "AXTitle\0")
+                            .and_then(|t| string_of(&t))
+                            .as_deref()
+                            == Some(item_title)
+                },
+                |_, _| (),
+            )
+            .map(|found| found.is_some())
         }
     }
 

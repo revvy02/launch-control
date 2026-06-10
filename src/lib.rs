@@ -409,6 +409,25 @@ impl Child {
         }
     }
 
+    /// Read-only probe for a menu item's existence via the Accessibility API
+    /// (macOS only). Walks the same path as `press_menu_item` without
+    /// pressing — use at launch to pre-warm the target's accessibility
+    /// connection (first AX contact with a fresh app can block for seconds).
+    pub fn find_menu_item(&self, menu_title: &str, item_title: &str) -> Result<bool> {
+        #[cfg(target_os = "macos")]
+        {
+            return match self.inner {
+                Some(ref inner) => inner.find_menu_item(menu_title, item_title),
+                None => Err(Error::Platform("no GUI handle available".into())),
+            };
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (menu_title, item_title);
+            Err(Error::Unsupported)
+        }
+    }
+
     /// Send a keystroke to the process. Does not require the app to be focused.
     ///
     /// Uses `CGEventPostToPSN` on macOS to post directly to the process's event queue.
