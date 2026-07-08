@@ -286,6 +286,16 @@ mod ax {
         fn AXUIElementPerformAction(element: AXUIElementRef, action: CFStringRef) -> AXError;
         fn AXUIElementSetMessagingTimeout(element: AXUIElementRef, timeout_secs: f32) -> AXError;
         fn AXUIElementCreateSystemWide() -> AXUIElementRef;
+        fn AXUIElementSetAttributeValue(
+            element: AXUIElementRef,
+            attribute: CFStringRef,
+            value: CFTypeRef,
+        ) -> AXError;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        static kCFBooleanTrue: CFTypeRef;
     }
 
     #[link(name = "CoreFoundation", kind = "framework")]
@@ -377,6 +387,30 @@ mod ax {
             if app.isHidden() {
                 app.unhide();
             }
+        }
+    }
+
+    /// PID of the currently frontmost application, if any.
+    fn frontmost_pid() -> Option<u32> {
+        use objc2_app_kit::NSWorkspace;
+        NSWorkspace::sharedWorkspace()
+            .frontmostApplication()
+            .map(|a| a.processIdentifier() as u32)
+    }
+
+    /// Activate an app by setting kAXFrontmostAttribute on its AX application
+    /// element. Unlike `NSRunningApplication.activate` — which cooperative
+    /// activation (macOS 14+) silently denies for CLI callers that are not
+    /// themselves frontmost — the accessibility route is honored for any
+    /// AX-trusted process (it is how window managers switch apps).
+    fn set_frontmost_app(pid: u32) -> AXError {
+        let app = CFOwned(unsafe { AXUIElementCreateApplication(pid as libc::pid_t) } as CFTypeRef);
+        if app.0.is_null() {
+            return -1;
+        }
+        let attr = cf_string("AXFrontmost\0");
+        unsafe {
+            AXUIElementSetAttributeValue(app.0 as AXUIElementRef, attr.0, kCFBooleanTrue)
         }
     }
 
@@ -480,8 +514,17 @@ mod ax {
 
     /// AXPress gate + action for a matched item. Disabled items swallow
     /// AXPress silently (observed: hidden Studio's File > Save to File
-    /// no-ops). A hidden app may not validate menus — unhide (no focus
-    /// steal) and re-check once before giving up.
+    /// no-ops). Two recovery steps before giving up, cheapest first:
+    /// 1. unhide (no focus steal) — a hidden app may not validate menus.
+    /// 2. activation flash via kAXFrontmostAttribute — Qt apps never
+    ///    validate their native menu bar until their FIRST activation
+    ///    (observed macOS 26 / Studio 0.729: a background-launched Studio
+    ///    reports AXEnabled=false on every File item indefinitely, and
+    ///    AXPress on them is silently swallowed). Cooperative activation
+    ///    denies `NSRunningApplication.activate` from CLI callers, but the
+    ///    AX route is honored for AX-trusted processes. Validation persists
+    ///    after deactivation, so the flash happens at most once per app;
+    ///    the previously frontmost app is restored right after the press.
     unsafe fn press_first_matching(
         pid: u32,
         desc: &str,
@@ -492,17 +535,43 @@ mod ax {
                 let enabled = |item: AXUIElementRef| {
                     copy_attr(item, "AXEnabled\0").and_then(|v| bool_of(&v))
                 };
+                let mut restore_front: Option<u32> = None;
                 if enabled(item) == Some(false) {
                     unhide_app(pid);
                     std::thread::sleep(std::time::Duration::from_millis(300));
+                }
+                if enabled(item) == Some(false) {
+                    let prev = frontmost_pid().filter(|&p| p != pid);
+                    let ax_err = set_frontmost_app(pid);
+                    tracing::info!(
+                        pid, title, ax_err, prev_frontmost = ?prev,
+                        "ax: item disabled — activation flash to force menu validation ({desc})"
+                    );
+                    restore_front = prev;
+                    // Menu validation lands within a few hundred ms of
+                    // activation; poll briefly instead of a fixed sleep.
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                    while enabled(item) == Some(false) && std::time::Instant::now() < deadline {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
                     if enabled(item) == Some(false) {
+                        if let Some(prev) = restore_front {
+                            let _ = set_frontmost_app(prev);
+                        }
                         return Err(Error::Platform(format!(
-                            "menu item '{title}' is disabled (even after unhide)"
+                            "menu item '{title}' is disabled (even after unhide + activation flash)"
                         )));
                     }
                 }
                 let action = cf_string("AXPress\0");
                 let err = AXUIElementPerformAction(item, action.0);
+                // Hand focus back to whoever had it before the flash. Done
+                // after the press: the press itself needs no focus once the
+                // item is validated, but restoring first would re-order the
+                // app switch behind the pending AXPress on some runloops.
+                if let Some(prev) = restore_front {
+                    let _ = set_frontmost_app(prev);
+                }
                 if err == K_AX_ERROR_SUCCESS {
                     tracing::info!(pid, title, "ax: pressed menu item ({desc})");
                     Ok(())
